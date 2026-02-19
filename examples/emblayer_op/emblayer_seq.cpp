@@ -11,6 +11,45 @@ torch::Tensor emblayer_seq_cuda(
     int64_t max_seq_len,
     int64_t pad_value);
 
+  torch::Tensor emblayer_seq_fast(
+    torch::Tensor seq_values,
+    torch::Tensor prefix,
+    torch::Tensor seq_lengths,
+    torch::Tensor seq_offsets,
+    int64_t pad_value,
+    int64_t max_seq_num,
+    int64_t max_seq_len) {
+    TORCH_CHECK(seq_values.is_cuda(), "seq_values must be CUDA");
+    TORCH_CHECK(prefix.is_cuda(), "prefix must be CUDA");
+    TORCH_CHECK(seq_lengths.is_cuda(), "seq_lengths must be CUDA");
+    TORCH_CHECK(seq_offsets.is_cuda(), "seq_offsets must be CUDA");
+
+    TORCH_CHECK(seq_values.dim() == 1, "seq_values must be 1D");
+    TORCH_CHECK(prefix.dim() == 1, "prefix must be 1D");
+    TORCH_CHECK(seq_lengths.dim() == 1, "seq_lengths must be 1D");
+    TORCH_CHECK(seq_offsets.dim() == 1, "seq_offsets must be 1D");
+
+    TORCH_CHECK(prefix.scalar_type() == torch::kInt64, "prefix must be int64 in fast path");
+    TORCH_CHECK(seq_lengths.scalar_type() == torch::kInt64, "seq_lengths must be int64 in fast path");
+    TORCH_CHECK(seq_offsets.scalar_type() == torch::kInt64, "seq_offsets must be int64 in fast path");
+
+    TORCH_CHECK(prefix.is_contiguous(), "prefix must be contiguous");
+    TORCH_CHECK(seq_lengths.is_contiguous(), "seq_lengths must be contiguous");
+    TORCH_CHECK(seq_offsets.is_contiguous(), "seq_offsets must be contiguous");
+
+    TORCH_CHECK(max_seq_num > 0, "max_seq_num must be > 0");
+    TORCH_CHECK(max_seq_len > 0, "max_seq_len must be > 0");
+
+    return emblayer_seq_cuda(
+      seq_values,
+      prefix,
+      seq_lengths,
+      seq_offsets,
+      max_seq_num,
+      max_seq_len,
+      pad_value);
+  }
+
 torch::Tensor emblayer_seq(
     torch::Tensor seq_values,
     torch::Tensor prefix,
@@ -109,4 +148,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("max_seq_num") = -1,
       py::arg("max_seq_len") = -1,
       "emblayerSeq CUDA op: rebuild padded [B, max_seq_num, max_seq_len] tensor from compressed sequence buffer");
+
+  m.def(
+      "emblayer_seq_fast",
+      &emblayer_seq_fast,
+      py::arg("seq_values"),
+      py::arg("prefix"),
+      py::arg("seq_lengths"),
+      py::arg("seq_offsets"),
+      py::arg("pad_value") = 0,
+      py::arg("max_seq_num"),
+      py::arg("max_seq_len"),
+      "emblayerSeq fast path: all metadata already on CUDA int64 tensors");
 }

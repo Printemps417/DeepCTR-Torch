@@ -66,19 +66,48 @@ def load_emblayer_vec_extension():
     )
 
 
-def build_din_model(device, max_seq_len=256):
-    feature_columns = [
-        SparseFeat('user', 200000, embedding_dim=16),
-        SparseFeat('gender', 4, embedding_dim=8),
-        SparseFeat('item', 500000, embedding_dim=16),
-        SparseFeat('item_gender', 4, embedding_dim=8),
-        DenseFeat('score', 1),
-    ]
-    feature_columns += [
-        VarLenSparseFeat(SparseFeat('hist_item', 500000, embedding_dim=16), max_seq_len, length_name='seq_length'),
-        VarLenSparseFeat(SparseFeat('hist_item_gender', 4, embedding_dim=8), max_seq_len, length_name='seq_length'),
-    ]
-    model = DIN(feature_columns, ['item', 'item_gender'], device=device, att_weight_normalization=True)
+def build_din_model(
+    device,
+    max_seq_len=256,
+    num_sparse=200,
+    num_seq=100,
+    even_vocab_size=500000,
+    odd_vocab_size=4,
+):
+    if num_seq > num_sparse:
+        raise ValueError('num_seq must be <= num_sparse')
+
+    sparse_feature_columns = []
+    for idx in range(num_sparse):
+        if idx % 2 == 0:
+            vocab_size = even_vocab_size
+            embedding_dim = 32
+        else:
+            vocab_size = odd_vocab_size
+            embedding_dim = 16
+        sparse_feature_columns.append(
+            SparseFeat(f'sparse_{idx}', vocab_size, embedding_dim=embedding_dim)
+        )
+
+    history_feature_names = [f'sparse_{idx}' for idx in range(num_seq)]
+    varlen_feature_columns = []
+    for idx in range(num_seq):
+        if idx % 2 == 0:
+            vocab_size = even_vocab_size
+            embedding_dim = 32
+        else:
+            vocab_size = odd_vocab_size
+            embedding_dim = 16
+        varlen_feature_columns.append(
+            VarLenSparseFeat(
+                SparseFeat(f'hist_sparse_{idx}', vocab_size, embedding_dim=embedding_dim),
+                max_seq_len,
+                length_name='seq_length',
+            )
+        )
+
+    feature_columns = sparse_feature_columns + [DenseFeat('score', 1)] + varlen_feature_columns
+    model = DIN(feature_columns, history_feature_names, device=device, att_weight_normalization=True)
     model.eval()
     return model, feature_columns
 
@@ -92,6 +121,44 @@ def _to_device(tensor, device):
 def _sync_if_cuda(device):
     if device.startswith('cuda'):
         torch.cuda.synchronize()
+
+
+def _merge_layout(compact_layout):
+    if not compact_layout:
+        return []
+
+    merged = [list(compact_layout[0])]
+    for dst_s, dst_e, src_s, src_e in compact_layout[1:]:
+        last = merged[-1]
+        if last[1] == dst_s and last[3] == src_s:
+            last[1] = dst_e
+            last[3] = src_e
+        else:
+            merged.append([dst_s, dst_e, src_s, src_e])
+
+    return [tuple(item) for item in merged]
+
+
+def _build_seq_assign_layout(seq_feature_info, max_seq_len):
+    if not seq_feature_info:
+        return []
+
+    layout = []
+    for seq_idx, info in enumerate(seq_feature_info):
+        if info['col_end'] - info['col_start'] != max_seq_len:
+            raise ValueError('seq feature width must equal max_seq_len for packed assignment')
+        layout.append((info['col_start'], info['col_end'], seq_idx, seq_idx + 1))
+
+    merged = [list(layout[0])]
+    for dst_s, dst_e, seq_s, seq_e in layout[1:]:
+        last = merged[-1]
+        if last[1] == dst_s and last[3] == seq_s:
+            last[1] = dst_e
+            last[3] = seq_e
+        else:
+            merged.append([dst_s, dst_e, seq_s, seq_e])
+
+    return [tuple(item) for item in merged]
 
 
 def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, seed=2026):
@@ -174,6 +241,8 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
         for info in seq_feature_info:
             seq_values.append(seq_tokens_by_feature[info['name']][row])
     seq_values = np.concatenate(seq_values, axis=0).astype(np.int32)
+    seq_offsets = np.zeros((seq_lengths.shape[0] + 1,), dtype=np.int64)
+    seq_offsets[1:] = np.cumsum(seq_lengths.astype(np.int64), axis=0)
 
     # vec compressed (for stage4)
     vec_values = []
@@ -203,6 +272,7 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
         'seq_values': torch.from_numpy(seq_values),
         'seq_prefix': torch.from_numpy(seq_prefix),
         'seq_lengths': torch.from_numpy(seq_lengths),
+        'seq_offsets': torch.from_numpy(seq_offsets),
         'vec_values': torch.from_numpy(vec_values),
         'vec_indices': torch.from_numpy(vec_indices),
         'vec_prefix': torch.from_numpy(vec_prefix),
@@ -232,7 +302,7 @@ class DINMultiSliceInfer(nn.Module):
     def __init__(self, model, compact_layout, starts, span_lengths, multislice_ext):
         super().__init__()
         self.model = model
-        self.compact_layout = compact_layout
+        self.compact_layout = _merge_layout(compact_layout)
         self.starts = starts
         self.span_lengths = span_lengths
         self.multislice_ext = multislice_ext
@@ -245,33 +315,47 @@ class DINMultiSliceInfer(nn.Module):
         return self.model(x)
 
 
+class DINBaselinePerInputSlice(nn.Module):
+    def __init__(self, model, input_spans):
+        super().__init__()
+        self.model = model
+        self.input_spans = input_spans
+
+    def forward(self, full_input):
+        parts = [full_input[:, span[0]:span[1]] for span in self.input_spans]
+        rebuilt = torch.cat(parts, dim=-1)
+        return self.model(rebuilt)
+
+
 class DINSeqOnlyInfer(nn.Module):
     def __init__(self, model, seq_feature_info, compact_layout, input_dim, num_seq_per_sample, max_seq_len, emblayer_seq_ext):
         super().__init__()
         self.model = model
-        self.seq_feature_info = seq_feature_info
-        self.compact_layout = compact_layout
+        self.compact_layout = _merge_layout(compact_layout)
+        self.seq_assign_layout = _build_seq_assign_layout(seq_feature_info, max_seq_len)
         self.input_dim = input_dim
         self.num_seq_per_sample = num_seq_per_sample
         self.max_seq_len = max_seq_len
         self.emblayer_seq_ext = emblayer_seq_ext
 
-    def forward(self, non_seq_compact, seq_values, seq_prefix, seq_lengths):
+    def forward(self, non_seq_compact, seq_values, seq_prefix, seq_lengths, seq_offsets):
         batch_size = non_seq_compact.size(0)
         x = torch.zeros((batch_size, self.input_dim), device=non_seq_compact.device, dtype=non_seq_compact.dtype)
         for dst_s, dst_e, src_s, src_e in self.compact_layout:
             x[:, dst_s:dst_e] = non_seq_compact[:, src_s:src_e]
 
-        seq_padded = self.emblayer_seq_ext.emblayer_seq(
+        seq_padded = self.emblayer_seq_ext.emblayer_seq_fast(
             seq_values,
             seq_prefix,
             seq_lengths,
+            seq_offsets,
             0,
             self.num_seq_per_sample,
             self.max_seq_len,
         )
-        for seq_idx, info in enumerate(self.seq_feature_info):
-            x[:, info['col_start']:info['col_end']] = seq_padded[:, seq_idx, :].to(x.dtype)
+        for dst_s, dst_e, seq_s, seq_e in self.seq_assign_layout:
+            packed = seq_padded[:, seq_s:seq_e, :].reshape(seq_padded.size(0), -1)
+            x[:, dst_s:dst_e] = packed.to(x.dtype)
         return self.model(x)
 
 
@@ -279,8 +363,8 @@ class DINMultiSliceSeqInfer(nn.Module):
     def __init__(self, model, seq_feature_info, compact_layout, starts, span_lengths, input_dim, num_seq_per_sample, max_seq_len, multislice_ext, emblayer_seq_ext):
         super().__init__()
         self.model = model
-        self.seq_feature_info = seq_feature_info
-        self.compact_layout = compact_layout
+        self.seq_assign_layout = _build_seq_assign_layout(seq_feature_info, max_seq_len)
+        self.compact_layout = _merge_layout(compact_layout)
         self.starts = starts
         self.span_lengths = span_lengths
         self.input_dim = input_dim
@@ -289,23 +373,25 @@ class DINMultiSliceSeqInfer(nn.Module):
         self.multislice_ext = multislice_ext
         self.emblayer_seq_ext = emblayer_seq_ext
 
-    def forward(self, non_seq_full, seq_values, seq_prefix, seq_lengths):
+    def forward(self, non_seq_full, seq_values, seq_prefix, seq_lengths, seq_offsets):
         compact = self.multislice_ext.multislice(non_seq_full, self.starts, self.span_lengths)
         batch_size = non_seq_full.size(0)
         x = torch.zeros((batch_size, self.input_dim), device=non_seq_full.device, dtype=non_seq_full.dtype)
         for dst_s, dst_e, src_s, src_e in self.compact_layout:
             x[:, dst_s:dst_e] = compact[:, src_s:src_e]
 
-        seq_padded = self.emblayer_seq_ext.emblayer_seq(
+        seq_padded = self.emblayer_seq_ext.emblayer_seq_fast(
             seq_values,
             seq_prefix,
             seq_lengths,
+            seq_offsets,
             0,
             self.num_seq_per_sample,
             self.max_seq_len,
         )
-        for seq_idx, info in enumerate(self.seq_feature_info):
-            x[:, info['col_start']:info['col_end']] = seq_padded[:, seq_idx, :].to(x.dtype)
+        for dst_s, dst_e, seq_s, seq_e in self.seq_assign_layout:
+            packed = seq_padded[:, seq_s:seq_e, :].reshape(seq_padded.size(0), -1)
+            x[:, dst_s:dst_e] = packed.to(x.dtype)
         return self.model(x)
 
 
@@ -313,70 +399,80 @@ class DINJointInfer(nn.Module):
     def __init__(self, model, seq_feature_info, input_dim, num_seq_per_sample, max_seq_len, emblayer_seq_ext, emblayer_vec_ext):
         super().__init__()
         self.model = model
-        self.seq_feature_info = seq_feature_info
+        self.seq_assign_layout = _build_seq_assign_layout(seq_feature_info, max_seq_len)
         self.input_dim = input_dim
         self.num_seq_per_sample = num_seq_per_sample
         self.max_seq_len = max_seq_len
         self.emblayer_seq_ext = emblayer_seq_ext
         self.emblayer_vec_ext = emblayer_vec_ext
 
-    def forward(self, vec_values, vec_prefix, vec_indices, seq_values, seq_prefix, seq_lengths):
-        x = self.emblayer_vec_ext.emblayer_vec(vec_values, vec_prefix, vec_indices, self.input_dim, 0.0)
-        seq_padded = self.emblayer_seq_ext.emblayer_seq(
+    def forward(self, vec_values, vec_prefix, vec_indices, seq_values, seq_prefix, seq_lengths, seq_offsets):
+        x = self.emblayer_vec_ext.emblayer_vec_fast(vec_values, vec_prefix, vec_indices, self.input_dim, 0.0)
+        seq_padded = self.emblayer_seq_ext.emblayer_seq_fast(
             seq_values,
             seq_prefix,
             seq_lengths,
+            seq_offsets,
             0,
             self.num_seq_per_sample,
             self.max_seq_len,
         )
-        for seq_idx, info in enumerate(self.seq_feature_info):
-            x[:, info['col_start']:info['col_end']] = seq_padded[:, seq_idx, :].to(x.dtype)
+        for dst_s, dst_e, seq_s, seq_e in self.seq_assign_layout:
+            packed = seq_padded[:, seq_s:seq_e, :].reshape(seq_padded.size(0), -1)
+            x[:, dst_s:dst_e] = packed.to(x.dtype)
         return self.model(x)
 
 
-def _prepare_inputs(mode, host_data, device):
+def _prepare_inputs(mode, host_data, device, scheduler_side_concat):
     if mode == 'baseline':
         return {'full': _to_device(host_data['full'], device)}
     if mode == 'multislice':
+        return {'full': _to_device(host_data['full'], device)}
+    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint'):
         return {'full': _to_device(host_data['full'], device)}
     if mode == 'multislice_seq':
         return {
             'non_seq_full': _to_device(host_data['non_seq_full'], device),
             'seq_values': _to_device(host_data['seq_values'], device),
-            'seq_prefix': _to_device(host_data['seq_prefix'], device),
-            'seq_lengths': _to_device(host_data['seq_lengths'], device),
+            'seq_prefix': _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            'seq_lengths': _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            'seq_offsets': _to_device(host_data['seq_offsets'].to(torch.int64), device),
         }
     if mode == 'seq_only':
         return {
             'non_seq_compact': _to_device(host_data['non_seq_compact'], device),
             'seq_values': _to_device(host_data['seq_values'], device),
-            'seq_prefix': _to_device(host_data['seq_prefix'], device),
-            'seq_lengths': _to_device(host_data['seq_lengths'], device),
+            'seq_prefix': _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            'seq_lengths': _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            'seq_offsets': _to_device(host_data['seq_offsets'].to(torch.int64), device),
         }
     if mode == 'joint':
         return {
             'vec_values': _to_device(host_data['vec_values'], device),
-            'vec_prefix': _to_device(host_data['vec_prefix'], device),
-            'vec_indices': _to_device(host_data['vec_indices'], device),
+            'vec_prefix': _to_device(host_data['vec_prefix'].to(torch.int64), device),
+            'vec_indices': _to_device(host_data['vec_indices'].to(torch.int64), device),
             'seq_values': _to_device(host_data['seq_values'], device),
-            'seq_prefix': _to_device(host_data['seq_prefix'], device),
-            'seq_lengths': _to_device(host_data['seq_lengths'], device),
+            'seq_prefix': _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            'seq_lengths': _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            'seq_offsets': _to_device(host_data['seq_offsets'].to(torch.int64), device),
         }
     raise ValueError(f'unknown mode: {mode}')
 
 
-def _forward_mode(mode, model, infer_models, dev_inputs):
+def _forward_mode(mode, model, infer_models, dev_inputs, scheduler_side_concat):
     if mode == 'baseline':
-        return model(dev_inputs['full'])
+        return infer_models['baseline'](dev_inputs['full'])
     if mode == 'multislice':
         return infer_models['multislice'](dev_inputs['full'])
+    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint'):
+        return infer_models['baseline_raw'](dev_inputs['full'])
     if mode == 'multislice_seq':
         return infer_models['multislice_seq'](
             dev_inputs['non_seq_full'],
             dev_inputs['seq_values'],
             dev_inputs['seq_prefix'],
             dev_inputs['seq_lengths'],
+            dev_inputs['seq_offsets'],
         )
     if mode == 'seq_only':
         return infer_models['seq_only'](
@@ -384,6 +480,7 @@ def _forward_mode(mode, model, infer_models, dev_inputs):
             dev_inputs['seq_values'],
             dev_inputs['seq_prefix'],
             dev_inputs['seq_lengths'],
+            dev_inputs['seq_offsets'],
         )
     if mode == 'joint':
         return infer_models['joint'](
@@ -393,28 +490,96 @@ def _forward_mode(mode, model, infer_models, dev_inputs):
             dev_inputs['seq_values'],
             dev_inputs['seq_prefix'],
             dev_inputs['seq_lengths'],
+            dev_inputs['seq_offsets'],
         )
     raise ValueError(f'unknown mode: {mode}')
 
 
-def benchmark_mode(mode, model, infer_models, host_data, device, iters, warmup, include_h2d):
+def _build_export_payload(mode, infer_models, host_data, device, scheduler_side_concat, export_no_custom_ops):
+    if export_no_custom_ops and mode in ('multislice', 'multislice_seq', 'seq_only', 'joint'):
+        return infer_models['baseline_raw'], (_to_device(host_data['full'], device),), ['full_input']
+
+    if mode == 'baseline':
+        return infer_models['baseline'], (_to_device(host_data['full'], device),), ['full_input']
+    if mode == 'multislice':
+        return infer_models['multislice'], (_to_device(host_data['full'], device),), ['full_input']
+
+    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint'):
+        return infer_models['baseline_raw'], (_to_device(host_data['full'], device),), ['full_input']
+
+    if mode == 'multislice_seq':
+        return infer_models['multislice_seq'], (
+            _to_device(host_data['non_seq_full'], device),
+            _to_device(host_data['seq_values'], device),
+            _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            _to_device(host_data['seq_offsets'].to(torch.int64), device),
+        ), ['non_seq_full', 'seq_values', 'seq_prefix', 'seq_lengths', 'seq_offsets']
+
+    if mode == 'seq_only':
+        return infer_models['seq_only'], (
+            _to_device(host_data['non_seq_compact'], device),
+            _to_device(host_data['seq_values'], device),
+            _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            _to_device(host_data['seq_offsets'].to(torch.int64), device),
+        ), ['non_seq_compact', 'seq_values', 'seq_prefix', 'seq_lengths', 'seq_offsets']
+
+    if mode == 'joint':
+        return infer_models['joint'], (
+            _to_device(host_data['vec_values'], device),
+            _to_device(host_data['vec_prefix'].to(torch.int64), device),
+            _to_device(host_data['vec_indices'].to(torch.int64), device),
+            _to_device(host_data['seq_values'], device),
+            _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            _to_device(host_data['seq_offsets'].to(torch.int64), device),
+        ), ['vec_values', 'vec_prefix', 'vec_indices', 'seq_values', 'seq_prefix', 'seq_lengths', 'seq_offsets']
+
+    raise ValueError(f'unknown mode for export: {mode}')
+
+
+def export_mode_onnx(mode, infer_models, host_data, device, scheduler_side_concat, onnx_path, opset, export_no_custom_ops):
+    module, export_args, input_names = _build_export_payload(
+        mode=mode,
+        infer_models=infer_models,
+        host_data=host_data,
+        device=device,
+        scheduler_side_concat=scheduler_side_concat,
+        export_no_custom_ops=export_no_custom_ops,
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(onnx_path)), exist_ok=True)
+    module.eval()
+    with torch.no_grad():
+        torch.onnx.export(
+            module,
+            export_args,
+            onnx_path,
+            input_names=input_names,
+            output_names=['output'],
+            opset_version=opset,
+            do_constant_folding=True,
+        )
+
+
+def benchmark_mode(mode, model, infer_models, host_data, device, iters, warmup, include_h2d, scheduler_side_concat):
     if not include_h2d:
-        dev_inputs = _prepare_inputs(mode, host_data, device)
+        dev_inputs = _prepare_inputs(mode, host_data, device, scheduler_side_concat)
 
     _sync_if_cuda(device)
     with torch.no_grad():
         for _ in range(warmup):
             if include_h2d:
-                dev_inputs = _prepare_inputs(mode, host_data, device)
-            _ = _forward_mode(mode, model, infer_models, dev_inputs)
+                dev_inputs = _prepare_inputs(mode, host_data, device, scheduler_side_concat)
+            _ = _forward_mode(mode, model, infer_models, dev_inputs, scheduler_side_concat)
 
     _sync_if_cuda(device)
     t0 = time.perf_counter()
     with torch.no_grad():
         for _ in range(iters):
             if include_h2d:
-                dev_inputs = _prepare_inputs(mode, host_data, device)
-            y = _forward_mode(mode, model, infer_models, dev_inputs)
+                dev_inputs = _prepare_inputs(mode, host_data, device, scheduler_side_concat)
+            y = _forward_mode(mode, model, infer_models, dev_inputs, scheduler_side_concat)
     _sync_if_cuda(device)
     t1 = time.perf_counter()
 
@@ -422,17 +587,17 @@ def benchmark_mode(mode, model, infer_models, host_data, device, iters, warmup, 
     return e2e_ms, y
 
 
-def h2d_only_ms(mode, host_data, device, iters, warmup):
+def h2d_only_ms(mode, host_data, device, iters, warmup, scheduler_side_concat):
     if not device.startswith('cuda'):
         return 0.0
 
     for _ in range(warmup):
-        _ = _prepare_inputs(mode, host_data, device)
+        _ = _prepare_inputs(mode, host_data, device, scheduler_side_concat)
     torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     for _ in range(iters):
-        _ = _prepare_inputs(mode, host_data, device)
+        _ = _prepare_inputs(mode, host_data, device, scheduler_side_concat)
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     return (t1 - t0) * 1000.0 / iters
@@ -446,8 +611,18 @@ def main():
     parser.add_argument('--batch_size', type=int, default=1024)
     parser.add_argument('--max_seq_len', type=int, default=256)
     parser.add_argument('--avg_seq_len', type=float, default=8.0)
+    parser.add_argument('--num_sparse', type=int, default=200)
+    parser.add_argument('--num_seq', type=int, default=100)
+    parser.add_argument('--even_vocab_size', type=int, default=500000)
+    parser.add_argument('--odd_vocab_size', type=int, default=4)
+    parser.add_argument('--scheduler_side_concat', dest='scheduler_side_concat', action='store_true')
+    parser.add_argument('--rebuild_from_emblayer', dest='scheduler_side_concat', action='store_false')
+    parser.add_argument('--export_onnx', type=str, default='')
+    parser.add_argument('--export_opset', type=int, default=18)
+    parser.add_argument('--export_no_custom_ops', action='store_true')
     parser.add_argument('--include_h2d', action='store_true')
     parser.add_argument('--cpu', action='store_true')
+    parser.set_defaults(scheduler_side_concat=True, export_no_custom_ops=True)
     args = parser.parse_args()
 
     device = 'cpu'
@@ -456,10 +631,21 @@ def main():
 
     modes = ['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint'] if args.mode == 'all' else [args.mode]
 
-    if device == 'cpu' and any(m != 'baseline' for m in modes):
+    if args.export_onnx and args.mode == 'all':
+        raise ValueError('--export_onnx requires a single --mode (not all)')
+
+    allow_cpu_optimized_export = bool(args.export_onnx and args.export_no_custom_ops)
+    if device == 'cpu' and any(m != 'baseline' for m in modes) and not allow_cpu_optimized_export:
         raise RuntimeError('optimized modes require CUDA device')
 
-    model, feature_columns = build_din_model(device=device, max_seq_len=args.max_seq_len)
+    model, feature_columns = build_din_model(
+        device=device,
+        max_seq_len=args.max_seq_len,
+        num_sparse=args.num_sparse,
+        num_seq=args.num_seq,
+        even_vocab_size=args.even_vocab_size,
+        odd_vocab_size=args.odd_vocab_size,
+    )
     host_data = build_inputs(
         model=model,
         feature_columns=feature_columns,
@@ -474,22 +660,37 @@ def main():
     print('avg_seq_len(sampled):', round(host_data['stats']['avg_len'], 4),
           'min/max:', host_data['stats']['min_len'], '/', host_data['stats']['max_len'])
     print('include_h2d:', args.include_h2d)
+    print('scheduler_side_concat:', args.scheduler_side_concat)
     for key in ['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint']:
-        print(f'input_bytes {key}:', host_data['bytes'][key])
+        if args.scheduler_side_concat and key in ('multislice_seq', 'seq_only', 'joint'):
+            print(f'input_bytes {key}:', host_data['bytes']['baseline'])
+        else:
+            print(f'input_bytes {key}:', host_data['bytes'][key])
 
     multislice_ext = None
     seq_ext = None
     vec_ext = None
     infer_models = {}
 
-    if any(m in ('multislice', 'multislice_seq') for m in modes):
+    if 'baseline' in modes or args.export_onnx or (args.scheduler_side_concat and any(m in ('multislice_seq', 'seq_only', 'joint') for m in modes)):
+        input_spans = [model.feature_index[name] for name in model.feature_index]
+        input_spans = sorted(input_spans, key=lambda x: x[0])
+        infer_models['baseline'] = DINBaselinePerInputSlice(
+            model=model,
+            input_spans=input_spans,
+        ).to(device).eval()
+        infer_models['baseline_raw'] = model
+
+    skip_custom_for_export = bool(args.export_onnx and args.export_no_custom_ops)
+
+    if any(m in ('multislice', 'multislice_seq') for m in modes) and not (args.scheduler_side_concat and 'multislice_seq' in modes and 'multislice' not in modes) and not skip_custom_for_export:
         multislice_ext = load_multislice_extension()
-    if any(m in ('multislice_seq', 'seq_only', 'joint') for m in modes):
+    if any(m in ('multislice_seq', 'seq_only', 'joint') for m in modes) and not args.scheduler_side_concat and not skip_custom_for_export:
         seq_ext = load_emblayer_seq_extension()
-    if 'joint' in modes:
+    if 'joint' in modes and not args.scheduler_side_concat and not skip_custom_for_export:
         vec_ext = load_emblayer_vec_extension()
 
-    if 'multislice' in modes:
+    if 'multislice' in modes and not skip_custom_for_export:
         infer_models['multislice'] = DINMultiSliceInfer(
             model=model,
             compact_layout=host_data['compact_layout'],
@@ -498,7 +699,7 @@ def main():
             multislice_ext=multislice_ext,
         ).to(device).eval()
 
-    if 'multislice_seq' in modes:
+    if 'multislice_seq' in modes and not args.scheduler_side_concat and not skip_custom_for_export:
         infer_models['multislice_seq'] = DINMultiSliceSeqInfer(
             model=model,
             seq_feature_info=host_data['seq_feature_info'],
@@ -512,7 +713,7 @@ def main():
             emblayer_seq_ext=seq_ext,
         ).to(device).eval()
 
-    if 'seq_only' in modes:
+    if 'seq_only' in modes and not args.scheduler_side_concat and not skip_custom_for_export:
         infer_models['seq_only'] = DINSeqOnlyInfer(
             model=model,
             seq_feature_info=host_data['seq_feature_info'],
@@ -523,7 +724,7 @@ def main():
             emblayer_seq_ext=seq_ext,
         ).to(device).eval()
 
-    if 'joint' in modes:
+    if 'joint' in modes and not args.scheduler_side_concat and not skip_custom_for_export:
         infer_models['joint'] = DINJointInfer(
             model=model,
             seq_feature_info=host_data['seq_feature_info'],
@@ -538,6 +739,20 @@ def main():
     e2e = {}
     h2d = {}
 
+    if args.export_onnx:
+        export_mode_onnx(
+            mode=args.mode,
+            infer_models=infer_models,
+            host_data=host_data,
+            device=device,
+            scheduler_side_concat=args.scheduler_side_concat,
+            onnx_path=args.export_onnx,
+            opset=args.export_opset,
+            export_no_custom_ops=args.export_no_custom_ops,
+        )
+        print('exported onnx:', os.path.abspath(args.export_onnx))
+        return
+
     for mode in modes:
         e2e_ms, y = benchmark_mode(
             mode=mode,
@@ -548,13 +763,14 @@ def main():
             iters=args.iters,
             warmup=args.warmup,
             include_h2d=args.include_h2d,
+            scheduler_side_concat=args.scheduler_side_concat,
         )
         outputs[mode] = y
         e2e[mode] = e2e_ms
         print(f'{mode} avg latency (ms):', round(e2e_ms, 6))
 
         if args.include_h2d:
-            h2d_ms = h2d_only_ms(mode, host_data, device, args.iters, args.warmup)
+            h2d_ms = h2d_only_ms(mode, host_data, device, args.iters, args.warmup, args.scheduler_side_concat)
             h2d[mode] = h2d_ms
             print(f'{mode} h2d-only (ms):', round(h2d_ms, 6))
             print(f'{mode} est-compute(ms):', round(max(e2e_ms - h2d_ms, 0.0), 6))

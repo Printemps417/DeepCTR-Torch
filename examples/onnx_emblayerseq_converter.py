@@ -76,7 +76,6 @@ def convert_onnx_to_emblayerseq(
     graph = model.graph
     const_map = _build_const_value_map(graph)
 
-    range_to_name = {r: f'emblayer_seq_{i}' for i, r in enumerate(seq_ranges)}
     matched = {}
     nodes_to_remove = set()
 
@@ -85,59 +84,52 @@ def convert_onnx_to_emblayerseq(
         if parsed is None:
             continue
         cur_range = (parsed['start'], parsed['end'])
-        if cur_range not in range_to_name:
+        if cur_range not in seq_ranges:
             continue
         if cur_range in matched:
             continue
         matched[cur_range] = (idx, parsed['output'])
         nodes_to_remove.add(idx)
 
-    new_inputs = []
-    for seq_range in seq_ranges:
-        name = range_to_name[seq_range]
-        values_name = f'{name}_values'
-        prefix_name = f'{name}_prefix'
-        lengths_name = f'{name}_lengths'
+    existed_inputs = {x.name for x in graph.input}
+    values_name = 'emblayer_seq_values'
+    prefix_name = 'emblayer_seq_prefix'
+    lengths_name = 'emblayer_seq_lengths'
+    if values_name not in existed_inputs:
+        graph.input.extend([
+            helper.make_tensor_value_info(values_name, TensorProto.INT64, [None]),
+            helper.make_tensor_value_info(prefix_name, TensorProto.INT64, [None]),
+            helper.make_tensor_value_info(lengths_name, TensorProto.INT64, [None]),
+        ])
 
-        new_inputs.append(helper.make_tensor_value_info(values_name, TensorProto.INT64, [None]))
-        new_inputs.append(helper.make_tensor_value_info(prefix_name, TensorProto.INT64, [None]))
-        new_inputs.append(helper.make_tensor_value_info(lengths_name, TensorProto.INT64, [None]))
-
-    graph.input.extend(new_inputs)
-
-    first_inserted = False
     new_nodes = []
     inserted = 0
+    if matched:
+        ordered_ranges = [r for r in seq_ranges if r in matched]
+        ordered_outputs = [matched[r][1] for r in ordered_ranges]
+        seq_starts = [int(r[0]) for r in ordered_ranges]
+        seq_ends = [int(r[1]) for r in ordered_ranges]
+        seq_widths = [int(r[1] - r[0]) for r in ordered_ranges]
+
+        seq_node = helper.make_node(
+            'EmblayerSeq',
+            inputs=[values_name, prefix_name, lengths_name],
+            outputs=ordered_outputs,
+            domain=domain,
+            name='EmblayerSeq_aggregated',
+            pad_value=int(pad_value),
+            max_seq_num=int(len(ordered_ranges)),
+            max_seq_len=int(max(seq_widths) if seq_widths else 0),
+            output_2d=1,
+            seq_starts=seq_starts,
+            seq_ends=seq_ends,
+        )
+        new_nodes.append(seq_node)
+        inserted = 1
+
     for idx, node in enumerate(graph.node):
-        if not first_inserted and matched:
-            for seq_range in seq_ranges:
-                if seq_range not in matched:
-                    continue
-                start, end = seq_range
-                name = range_to_name[seq_range]
-                values_name = f'{name}_values'
-                prefix_name = f'{name}_prefix'
-                lengths_name = f'{name}_lengths'
-                _, output_name = matched[seq_range]
-
-                seq_node = helper.make_node(
-                    'EmblayerSeq',
-                    inputs=[values_name, prefix_name, lengths_name],
-                    outputs=[output_name],
-                    domain=domain,
-                    name=f'EmblayerSeq_{inserted}',
-                    pad_value=int(pad_value),
-                    max_seq_num=1,
-                    max_seq_len=int(end - start),
-                    output_2d=1,
-                )
-                new_nodes.append(seq_node)
-                inserted += 1
-            first_inserted = True
-
-        if idx in nodes_to_remove:
-            continue
-        new_nodes.append(node)
+        if idx not in nodes_to_remove:
+            new_nodes.append(node)
 
     del graph.node[:]
     graph.node.extend(new_nodes)

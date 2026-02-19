@@ -127,3 +127,6 @@ dmypy.json
 
 # profiling
 .data
+.onnx
+.nsys-rep
+*torch_extensions*

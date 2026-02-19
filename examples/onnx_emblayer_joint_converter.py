@@ -114,56 +114,73 @@ def convert_onnx_to_emblayer_joint(
                 helper.make_tensor_value_info(seq_lengths_name, TensorProto.INT64, [None]),
             ])
 
+    matched_vec = {}
+    matched_seq = {}
+    nodes_to_remove = set()
+    for idx, node in enumerate(graph.node):
+        parsed = _parse_slice_axis1(node, const_map)
+        if parsed is None:
+            continue
+        cur_range = (parsed['start'], parsed['end'])
+        if cur_range in vec_range_set and cur_range not in matched_vec:
+            matched_vec[cur_range] = (idx, parsed['output'])
+            nodes_to_remove.add(idx)
+        elif cur_range in seq_range_set and cur_range not in matched_seq:
+            matched_seq[cur_range] = (idx, parsed['output'])
+            nodes_to_remove.add(idx)
+
     new_nodes = []
-    removed_slice_nodes = 0
+    removed_slice_nodes = len(nodes_to_remove)
     inserted_vec_nodes = 0
     inserted_seq_nodes = 0
 
-    for node in graph.node:
-        parsed = _parse_slice_axis1(node, const_map)
-        if parsed is None:
-            new_nodes.append(node)
+    if matched_vec:
+        ordered_vec_ranges = [r for r in vec_ranges if r in matched_vec]
+        vec_outputs = [matched_vec[r][1] for r in ordered_vec_ranges]
+        vec_starts = [int(r[0]) for r in ordered_vec_ranges]
+        vec_ends = [int(r[1]) for r in ordered_vec_ranges]
+        vec_widths = [int(r[1] - r[0]) for r in ordered_vec_ranges]
+        vec_node = helper.make_node(
+            'EmblayerVec',
+            inputs=[vec_values_name, vec_prefix_name, vec_indices_name],
+            outputs=vec_outputs,
+            domain=domain,
+            name='EmblayerVec_aggregated',
+            output_dim=int(sum(vec_widths)),
+            col_start=int(min(vec_starts) if vec_starts else 0),
+            col_end=int(max(vec_ends) if vec_ends else 0),
+            pad_value=float(vec_pad_value),
+            vec_starts=vec_starts,
+            vec_ends=vec_ends,
+        )
+        new_nodes.append(vec_node)
+        inserted_vec_nodes = 1
+
+    if matched_seq:
+        ordered_seq_ranges = [r for r in seq_ranges if r in matched_seq]
+        seq_outputs = [matched_seq[r][1] for r in ordered_seq_ranges]
+        seq_starts = [int(r[0]) for r in ordered_seq_ranges]
+        seq_ends = [int(r[1]) for r in ordered_seq_ranges]
+        seq_widths = [int(r[1] - r[0]) for r in ordered_seq_ranges]
+        seq_node = helper.make_node(
+            'EmblayerSeq',
+            inputs=[seq_values_name, seq_prefix_name, seq_lengths_name],
+            outputs=seq_outputs,
+            domain=domain,
+            name='EmblayerSeq_aggregated',
+            pad_value=int(seq_pad_value),
+            max_seq_num=int(len(ordered_seq_ranges)),
+            max_seq_len=int(max(seq_widths) if seq_widths else 0),
+            output_2d=1,
+            seq_starts=seq_starts,
+            seq_ends=seq_ends,
+        )
+        new_nodes.append(seq_node)
+        inserted_seq_nodes = 1
+
+    for idx, node in enumerate(graph.node):
+        if idx in nodes_to_remove:
             continue
-
-        cur_range = (parsed['start'], parsed['end'])
-        output_name = parsed['output']
-
-        if cur_range in vec_range_set:
-            width = cur_range[1] - cur_range[0]
-            vec_node = helper.make_node(
-                'EmblayerVec',
-                inputs=[vec_values_name, vec_prefix_name, vec_indices_name],
-                outputs=[output_name],
-                domain=domain,
-                name=f'EmblayerVec_{inserted_vec_nodes}',
-                output_dim=int(width),
-                col_start=int(cur_range[0]),
-                col_end=int(cur_range[1]),
-                pad_value=float(vec_pad_value),
-            )
-            new_nodes.append(vec_node)
-            removed_slice_nodes += 1
-            inserted_vec_nodes += 1
-            continue
-
-        if cur_range in seq_range_set:
-            seq_width = cur_range[1] - cur_range[0]
-            seq_node = helper.make_node(
-                'EmblayerSeq',
-                inputs=[seq_values_name, seq_prefix_name, seq_lengths_name],
-                outputs=[output_name],
-                domain=domain,
-                name=f'EmblayerSeq_{inserted_seq_nodes}',
-                pad_value=int(seq_pad_value),
-                max_seq_num=1,
-                max_seq_len=int(seq_width),
-                output_2d=1,
-            )
-            new_nodes.append(seq_node)
-            removed_slice_nodes += 1
-            inserted_seq_nodes += 1
-            continue
-
         new_nodes.append(node)
 
     del graph.node[:]
