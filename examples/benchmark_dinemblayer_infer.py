@@ -118,6 +118,60 @@ def _to_device(tensor, device):
     return tensor.to(device)
 
 
+def _to_int64_host(tensor):
+    if tensor.dtype == torch.int64:
+        return tensor
+    return tensor.to(torch.int64)
+
+
+def _prepare_host_inputs_for_copy(mode, host_data, scheduler_side_concat):
+    if mode == 'baseline':
+        return {'full': host_data['full']}
+    if mode == 'multislice':
+        return {'full': host_data['full']}
+    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint', 'joint_v2'):
+        return {'full': host_data['full']}
+    if mode == 'multislice_seq':
+        return {
+            'non_seq_full': host_data['non_seq_full'],
+            'seq_values': host_data['seq_values'],
+            'seq_prefix': _to_int64_host(host_data['seq_prefix']),
+            'seq_lengths': _to_int64_host(host_data['seq_lengths']),
+            'seq_offsets': _to_int64_host(host_data['seq_offsets']),
+        }
+    if mode == 'seq_only':
+        return {
+            'non_seq_compact': host_data['non_seq_compact'],
+            'seq_values': host_data['seq_values'],
+            'seq_prefix': _to_int64_host(host_data['seq_prefix']),
+            'seq_lengths': _to_int64_host(host_data['seq_lengths']),
+            'seq_offsets': _to_int64_host(host_data['seq_offsets']),
+        }
+    if mode == 'joint':
+        return {
+            'vec_values': host_data['vec_values'],
+            'vec_prefix': _to_int64_host(host_data['vec_prefix']),
+            'vec_indices': _to_int64_host(host_data['vec_indices']),
+            'seq_values': host_data['seq_values'],
+            'seq_prefix': _to_int64_host(host_data['seq_prefix']),
+            'seq_lengths': _to_int64_host(host_data['seq_lengths']),
+            'seq_offsets': _to_int64_host(host_data['seq_offsets']),
+        }
+    if mode == 'joint_v2':
+        return {
+            'user_vec_values': host_data['user_vec_values'],
+            'user_vec_indices': _to_int64_host(host_data['user_vec_indices']),
+            'item_vec_values': host_data['item_vec_values'],
+            'item_vec_prefix': _to_int64_host(host_data['item_vec_prefix']),
+            'item_vec_indices': _to_int64_host(host_data['item_vec_indices']),
+            'seq_values': host_data['seq_values'],
+            'seq_prefix': _to_int64_host(host_data['seq_prefix']),
+            'seq_lengths': _to_int64_host(host_data['seq_lengths']),
+            'seq_offsets': _to_int64_host(host_data['seq_offsets']),
+        }
+    raise ValueError(f'unknown mode for pure h2d: {mode}')
+
+
 def _sync_if_cuda(device):
     if device.startswith('cuda'):
         torch.cuda.synchronize()
@@ -174,10 +228,20 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
     lengths = np.clip(lengths, 1, max_seq_len).astype(np.int32)
 
     non_seq_spans = []
+    user_non_seq_spans = []
+    item_non_seq_spans = []
+    user_sparse_count = int(getattr(model, 'user_sparse_count_for_emblayer_v2', 0))
     for feat in sparse_features:
+        sparse_idx = int(feat.name.split('_')[-1])
         s, e = model.feature_index[feat.name]
-        vals = rng.integers(1, feat.vocabulary_size, size=(batch_size,), endpoint=False).astype(np.float32)
-        full[:, s:e] = vals.reshape(batch_size, 1)
+        if sparse_idx < user_sparse_count:
+            val = float(rng.integers(1, feat.vocabulary_size, endpoint=False))
+            full[:, s:e] = np.full((batch_size, 1), val, dtype=np.float32)
+            user_non_seq_spans.append((s, e))
+        else:
+            vals = rng.integers(1, feat.vocabulary_size, size=(batch_size,), endpoint=False).astype(np.float32)
+            full[:, s:e] = vals.reshape(batch_size, 1)
+            item_non_seq_spans.append((s, e))
         non_seq_spans.append((s, e))
 
     for feat in dense_features:
@@ -185,6 +249,7 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
         vals = rng.random((batch_size, feat.dimension), dtype=np.float32)
         full[:, s:e] = vals
         non_seq_spans.append((s, e))
+        item_non_seq_spans.append((s, e))
 
     seq_length_name = None
     for feat in varlen_features:
@@ -194,6 +259,7 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
         s, e = model.feature_index[seq_length_name]
         full[:, s:e] = lengths.reshape(batch_size, 1).astype(np.float32)
         non_seq_spans.append((s, e))
+        item_non_seq_spans.append((s, e))
 
     seq_feature_info = []
     seq_tokens_by_feature = {}
@@ -211,6 +277,8 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
         seq_feature_info.append({'name': feat.name, 'col_start': s, 'col_end': e, 'maxlen': feat.maxlen})
 
     non_seq_spans = sorted(non_seq_spans, key=lambda x: x[0])
+    user_non_seq_spans = sorted(user_non_seq_spans, key=lambda x: x[0])
+    item_non_seq_spans = sorted(item_non_seq_spans, key=lambda x: x[0])
 
     # non-seq full-width tensor (for stage3)
     non_seq_full = np.zeros_like(full)
@@ -259,11 +327,35 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
     vec_indices = np.asarray(vec_indices, dtype=np.int32)
     vec_prefix = np.asarray(vec_prefix, dtype=np.int32)
 
+    user_vec_values = []
+    user_vec_indices = []
+    if user_non_seq_spans:
+        for s, e in user_non_seq_spans:
+            for col in range(s, e):
+                user_vec_values.append(full[0, col])
+                user_vec_indices.append(col)
+    user_vec_values = np.asarray(user_vec_values, dtype=np.float32)
+    user_vec_indices = np.asarray(user_vec_indices, dtype=np.int32)
+
+    item_vec_values = []
+    item_vec_indices = []
+    item_vec_prefix = [0]
+    for row in range(batch_size):
+        for s, e in item_non_seq_spans:
+            for col in range(s, e):
+                item_vec_values.append(full[row, col])
+                item_vec_indices.append(col)
+        item_vec_prefix.append(len(item_vec_values))
+    item_vec_values = np.asarray(item_vec_values, dtype=np.float32)
+    item_vec_indices = np.asarray(item_vec_indices, dtype=np.int32)
+    item_vec_prefix = np.asarray(item_vec_prefix, dtype=np.int32)
+
     bytes_baseline = full.nbytes
     bytes_multislice = full.nbytes
     bytes_multislice_seq = non_seq_full.nbytes + seq_values.nbytes + seq_prefix.nbytes + seq_lengths.nbytes
     bytes_seq_only = non_seq_compact.nbytes + seq_values.nbytes + seq_prefix.nbytes + seq_lengths.nbytes
     bytes_joint = vec_values.nbytes + vec_indices.nbytes + vec_prefix.nbytes + seq_values.nbytes + seq_prefix.nbytes + seq_lengths.nbytes
+    bytes_joint_v2 = user_vec_values.nbytes + user_vec_indices.nbytes + item_vec_values.nbytes + item_vec_indices.nbytes + item_vec_prefix.nbytes + seq_values.nbytes + seq_prefix.nbytes + seq_lengths.nbytes
 
     return {
         'full': torch.from_numpy(full),
@@ -276,6 +368,11 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
         'vec_values': torch.from_numpy(vec_values),
         'vec_indices': torch.from_numpy(vec_indices),
         'vec_prefix': torch.from_numpy(vec_prefix),
+        'user_vec_values': torch.from_numpy(user_vec_values),
+        'user_vec_indices': torch.from_numpy(user_vec_indices),
+        'item_vec_values': torch.from_numpy(item_vec_values),
+        'item_vec_indices': torch.from_numpy(item_vec_indices),
+        'item_vec_prefix': torch.from_numpy(item_vec_prefix),
         'compact_layout': compact_layout,
         'seq_feature_info': seq_feature_info,
         'starts': torch.tensor(starts, dtype=torch.int64),
@@ -289,6 +386,7 @@ def build_inputs(model, feature_columns, batch_size, max_seq_len, avg_seq_len, s
             'multislice_seq': bytes_multislice_seq,
             'seq_only': bytes_seq_only,
             'joint': bytes_joint,
+            'joint_v2': bytes_joint_v2,
         },
         'stats': {
             'avg_len': float(np.mean(lengths)),
@@ -423,12 +521,49 @@ class DINJointInfer(nn.Module):
         return self.model(x)
 
 
+class DINJointInferV2(nn.Module):
+    def __init__(self, model, seq_feature_info, input_dim, num_seq_per_sample, max_seq_len, emblayer_seq_ext, emblayer_vec_ext):
+        super().__init__()
+        self.model = model
+        self.seq_assign_layout = _build_seq_assign_layout(seq_feature_info, max_seq_len)
+        self.input_dim = input_dim
+        self.num_seq_per_sample = num_seq_per_sample
+        self.max_seq_len = max_seq_len
+        self.emblayer_seq_ext = emblayer_seq_ext
+        self.emblayer_vec_ext = emblayer_vec_ext
+
+    def forward(self, user_vec_values, user_vec_indices, item_vec_values, item_vec_prefix, item_vec_indices,
+                seq_values, seq_prefix, seq_lengths, seq_offsets):
+        x = self.emblayer_vec_ext.emblayer_vec_v2_fast(
+            user_vec_values,
+            user_vec_indices,
+            item_vec_values,
+            item_vec_prefix,
+            item_vec_indices,
+            self.input_dim,
+            0.0,
+        )
+        seq_padded = self.emblayer_seq_ext.emblayer_seq_fast(
+            seq_values,
+            seq_prefix,
+            seq_lengths,
+            seq_offsets,
+            0,
+            self.num_seq_per_sample,
+            self.max_seq_len,
+        )
+        for dst_s, dst_e, seq_s, seq_e in self.seq_assign_layout:
+            packed = seq_padded[:, seq_s:seq_e, :].reshape(seq_padded.size(0), -1)
+            x[:, dst_s:dst_e] = packed.to(x.dtype)
+        return self.model(x)
+
+
 def _prepare_inputs(mode, host_data, device, scheduler_side_concat):
     if mode == 'baseline':
         return {'full': _to_device(host_data['full'], device)}
     if mode == 'multislice':
         return {'full': _to_device(host_data['full'], device)}
-    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint'):
+    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint', 'joint_v2'):
         return {'full': _to_device(host_data['full'], device)}
     if mode == 'multislice_seq':
         return {
@@ -456,6 +591,18 @@ def _prepare_inputs(mode, host_data, device, scheduler_side_concat):
             'seq_lengths': _to_device(host_data['seq_lengths'].to(torch.int64), device),
             'seq_offsets': _to_device(host_data['seq_offsets'].to(torch.int64), device),
         }
+    if mode == 'joint_v2':
+        return {
+            'user_vec_values': _to_device(host_data['user_vec_values'], device),
+            'user_vec_indices': _to_device(host_data['user_vec_indices'].to(torch.int64), device),
+            'item_vec_values': _to_device(host_data['item_vec_values'], device),
+            'item_vec_prefix': _to_device(host_data['item_vec_prefix'].to(torch.int64), device),
+            'item_vec_indices': _to_device(host_data['item_vec_indices'].to(torch.int64), device),
+            'seq_values': _to_device(host_data['seq_values'], device),
+            'seq_prefix': _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            'seq_lengths': _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            'seq_offsets': _to_device(host_data['seq_offsets'].to(torch.int64), device),
+        }
     raise ValueError(f'unknown mode: {mode}')
 
 
@@ -464,7 +611,7 @@ def _forward_mode(mode, model, infer_models, dev_inputs, scheduler_side_concat):
         return infer_models['baseline'](dev_inputs['full'])
     if mode == 'multislice':
         return infer_models['multislice'](dev_inputs['full'])
-    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint'):
+    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint', 'joint_v2'):
         return infer_models['baseline_raw'](dev_inputs['full'])
     if mode == 'multislice_seq':
         return infer_models['multislice_seq'](
@@ -492,11 +639,23 @@ def _forward_mode(mode, model, infer_models, dev_inputs, scheduler_side_concat):
             dev_inputs['seq_lengths'],
             dev_inputs['seq_offsets'],
         )
+    if mode == 'joint_v2':
+        return infer_models['joint_v2'](
+            dev_inputs['user_vec_values'],
+            dev_inputs['user_vec_indices'],
+            dev_inputs['item_vec_values'],
+            dev_inputs['item_vec_prefix'],
+            dev_inputs['item_vec_indices'],
+            dev_inputs['seq_values'],
+            dev_inputs['seq_prefix'],
+            dev_inputs['seq_lengths'],
+            dev_inputs['seq_offsets'],
+        )
     raise ValueError(f'unknown mode: {mode}')
 
 
 def _build_export_payload(mode, infer_models, host_data, device, scheduler_side_concat, export_no_custom_ops):
-    if export_no_custom_ops and mode in ('multislice', 'multislice_seq', 'seq_only', 'joint'):
+    if export_no_custom_ops and mode in ('multislice', 'multislice_seq', 'seq_only', 'joint', 'joint_v2'):
         return infer_models['baseline_raw'], (_to_device(host_data['full'], device),), ['full_input']
 
     if mode == 'baseline':
@@ -504,7 +663,7 @@ def _build_export_payload(mode, infer_models, host_data, device, scheduler_side_
     if mode == 'multislice':
         return infer_models['multislice'], (_to_device(host_data['full'], device),), ['full_input']
 
-    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint'):
+    if scheduler_side_concat and mode in ('multislice_seq', 'seq_only', 'joint', 'joint_v2'):
         return infer_models['baseline_raw'], (_to_device(host_data['full'], device),), ['full_input']
 
     if mode == 'multislice_seq':
@@ -535,6 +694,19 @@ def _build_export_payload(mode, infer_models, host_data, device, scheduler_side_
             _to_device(host_data['seq_lengths'].to(torch.int64), device),
             _to_device(host_data['seq_offsets'].to(torch.int64), device),
         ), ['vec_values', 'vec_prefix', 'vec_indices', 'seq_values', 'seq_prefix', 'seq_lengths', 'seq_offsets']
+
+    if mode == 'joint_v2':
+        return infer_models['joint_v2'], (
+            _to_device(host_data['user_vec_values'], device),
+            _to_device(host_data['user_vec_indices'].to(torch.int64), device),
+            _to_device(host_data['item_vec_values'], device),
+            _to_device(host_data['item_vec_prefix'].to(torch.int64), device),
+            _to_device(host_data['item_vec_indices'].to(torch.int64), device),
+            _to_device(host_data['seq_values'], device),
+            _to_device(host_data['seq_prefix'].to(torch.int64), device),
+            _to_device(host_data['seq_lengths'].to(torch.int64), device),
+            _to_device(host_data['seq_offsets'].to(torch.int64), device),
+        ), ['user_vec_values', 'user_vec_indices', 'item_vec_values', 'item_vec_prefix', 'item_vec_indices', 'seq_values', 'seq_prefix', 'seq_lengths', 'seq_offsets']
 
     raise ValueError(f'unknown mode for export: {mode}')
 
@@ -603,9 +775,34 @@ def h2d_only_ms(mode, host_data, device, iters, warmup, scheduler_side_concat):
     return (t1 - t0) * 1000.0 / iters
 
 
+def pure_h2d_only_ms(mode, host_data, device, iters, warmup, scheduler_side_concat):
+    if not device.startswith('cuda'):
+        return 0.0
+
+    host_inputs = _prepare_host_inputs_for_copy(mode, host_data, scheduler_side_concat)
+    pinned_inputs = {}
+    for key, tensor in host_inputs.items():
+        pinned_inputs[key] = tensor.pin_memory()
+
+    host_tensors = tuple(pinned_inputs.values())
+
+    for _ in range(warmup):
+        for tensor in host_tensors:
+            _ = tensor.to(device, non_blocking=True)
+    torch.cuda.synchronize()
+
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        for tensor in host_tensors:
+            _ = tensor.to(device, non_blocking=True)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    return (t1 - t0) * 1000.0 / iters
+
+
 def main():
     parser = argparse.ArgumentParser(description='Unified 5-stage benchmark for DIN Emblayer optimizations')
-    parser.add_argument('--mode', type=str, choices=['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint', 'all'], default='all')
+    parser.add_argument('--mode', type=str, choices=['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint', 'joint_v2', 'all'], default='all')
     parser.add_argument('--iters', type=int, default=1000)
     parser.add_argument('--warmup', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=1024)
@@ -613,6 +810,8 @@ def main():
     parser.add_argument('--avg_seq_len', type=float, default=8.0)
     parser.add_argument('--num_sparse', type=int, default=200)
     parser.add_argument('--num_seq', type=int, default=100)
+    parser.add_argument('--user_sparse_count', type=int, default=0,
+                        help='Number of leading sparse_i treated as user-side shared features for emblayerV2')
     parser.add_argument('--even_vocab_size', type=int, default=500000)
     parser.add_argument('--odd_vocab_size', type=int, default=4)
     parser.add_argument('--scheduler_side_concat', dest='scheduler_side_concat', action='store_true')
@@ -629,7 +828,7 @@ def main():
     if not args.cpu and torch.cuda.is_available():
         device = 'cuda:0'
 
-    modes = ['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint'] if args.mode == 'all' else [args.mode]
+    modes = ['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint', 'joint_v2'] if args.mode == 'all' else [args.mode]
 
     if args.export_onnx and args.mode == 'all':
         raise ValueError('--export_onnx requires a single --mode (not all)')
@@ -646,6 +845,9 @@ def main():
         even_vocab_size=args.even_vocab_size,
         odd_vocab_size=args.odd_vocab_size,
     )
+    if args.user_sparse_count < 0 or args.user_sparse_count > args.num_sparse:
+        raise ValueError('--user_sparse_count must be in [0, num_sparse]')
+    model.user_sparse_count_for_emblayer_v2 = int(args.user_sparse_count)
     host_data = build_inputs(
         model=model,
         feature_columns=feature_columns,
@@ -661,8 +863,9 @@ def main():
           'min/max:', host_data['stats']['min_len'], '/', host_data['stats']['max_len'])
     print('include_h2d:', args.include_h2d)
     print('scheduler_side_concat:', args.scheduler_side_concat)
-    for key in ['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint']:
-        if args.scheduler_side_concat and key in ('multislice_seq', 'seq_only', 'joint'):
+    print('user_sparse_count(emblayerV2):', args.user_sparse_count)
+    for key in ['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint', 'joint_v2']:
+        if args.scheduler_side_concat and key in ('multislice_seq', 'seq_only', 'joint', 'joint_v2'):
             print(f'input_bytes {key}:', host_data['bytes']['baseline'])
         else:
             print(f'input_bytes {key}:', host_data['bytes'][key])
@@ -685,9 +888,9 @@ def main():
 
     if any(m in ('multislice', 'multislice_seq') for m in modes) and not (args.scheduler_side_concat and 'multislice_seq' in modes and 'multislice' not in modes) and not skip_custom_for_export:
         multislice_ext = load_multislice_extension()
-    if any(m in ('multislice_seq', 'seq_only', 'joint') for m in modes) and not args.scheduler_side_concat and not skip_custom_for_export:
+    if any(m in ('multislice_seq', 'seq_only', 'joint', 'joint_v2') for m in modes) and not args.scheduler_side_concat and not skip_custom_for_export:
         seq_ext = load_emblayer_seq_extension()
-    if 'joint' in modes and not args.scheduler_side_concat and not skip_custom_for_export:
+    if any(m in ('joint', 'joint_v2') for m in modes) and not args.scheduler_side_concat and not skip_custom_for_export:
         vec_ext = load_emblayer_vec_extension()
 
     if 'multislice' in modes and not skip_custom_for_export:
@@ -735,9 +938,21 @@ def main():
             emblayer_vec_ext=vec_ext,
         ).to(device).eval()
 
+    if 'joint_v2' in modes and not args.scheduler_side_concat and not skip_custom_for_export:
+        infer_models['joint_v2'] = DINJointInferV2(
+            model=model,
+            seq_feature_info=host_data['seq_feature_info'],
+            input_dim=host_data['input_dim'],
+            num_seq_per_sample=host_data['num_seq_per_sample'],
+            max_seq_len=host_data['max_seq_len'],
+            emblayer_seq_ext=seq_ext,
+            emblayer_vec_ext=vec_ext,
+        ).to(device).eval()
+
     outputs = {}
     e2e = {}
     h2d = {}
+    h2d_pure = {}
 
     if args.export_onnx:
         export_mode_onnx(
@@ -773,6 +988,10 @@ def main():
             h2d_ms = h2d_only_ms(mode, host_data, device, args.iters, args.warmup, args.scheduler_side_concat)
             h2d[mode] = h2d_ms
             print(f'{mode} h2d-only (ms):', round(h2d_ms, 6))
+            h2d_pure_ms = pure_h2d_only_ms(mode, host_data, device, args.iters, args.warmup, args.scheduler_side_concat)
+            h2d_pure[mode] = h2d_pure_ms
+            print(f'{mode} h2d-pure (ms):', round(h2d_pure_ms, 6))
+            print(f'{mode} h2d-prepare-overhead(ms):', round(max(h2d_ms - h2d_pure_ms, 0.0), 6))
             print(f'{mode} est-compute(ms):', round(max(e2e_ms - h2d_ms, 0.0), 6))
 
     if 'baseline' in outputs:
@@ -795,6 +1014,11 @@ def main():
             if mode == 'baseline' or mode not in h2d:
                 continue
             print(f'h2d speedup baseline/{mode}:', round(h2d['baseline'] / h2d[mode], 6))
+    if 'baseline' in h2d_pure:
+        for mode in modes:
+            if mode == 'baseline' or mode not in h2d_pure:
+                continue
+            print(f'h2d-pure speedup baseline/{mode}:', round(h2d_pure['baseline'] / h2d_pure[mode], 6))
 
 
 if __name__ == '__main__':

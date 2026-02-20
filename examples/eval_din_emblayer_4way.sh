@@ -11,19 +11,20 @@ OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/eval_din_emblayer_4way_outputs}"
 ONNX_DIR="$OUT_DIR/onnx"
 NSYS_DIR="$OUT_DIR/nsys"
 LOG_DIR="$OUT_DIR/logs"
-REPORT_PATH="$OUT_DIR/report.md"
+REPORT_PATH="$OUT_DIR/kernel_report.md"
 
-ITERS="${ITERS:-2000}"
-WARMUP="${WARMUP:-300}"
-BATCH_SIZE="${BATCH_SIZE:-1024}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-128}"
-AVG_SEQ_LEN="${AVG_SEQ_LEN:-8}"
+ITERS="${ITERS:-100}"
+WARMUP="${WARMUP:-20}"
+BATCH_SIZE="${BATCH_SIZE:-128}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-256}"
+AVG_SEQ_LEN="${AVG_SEQ_LEN:-128}"
 INCLUDE_H2D="${INCLUDE_H2D:-1}"
 BENCH_RUNTIME_MODE="${BENCH_RUNTIME_MODE:-emblayer}"
 NUM_SPARSE="${NUM_SPARSE:-200}"
 NUM_SEQ="${NUM_SEQ:-100}"
 EVEN_VOCAB_SIZE="${EVEN_VOCAB_SIZE:-4096}"
 ODD_VOCAB_SIZE="${ODD_VOCAB_SIZE:-64}"
+USER_SPARSE_COUNT="${USER_SPARSE_COUNT:-$((NUM_SPARSE / 2))}"
 
 SEQ_RANGES="${SEQ_RANGES:-}"
 VEC_RANGES="${VEC_RANGES:-}"
@@ -102,6 +103,7 @@ fi
 
 echo "[INFO] VEC_RANGES count: $(awk -F',' '{print NF}' <<< "$VEC_RANGES")"
 echo "[INFO] SEQ_RANGES count: $(awk -F',' '{print NF}' <<< "$SEQ_RANGES")"
+echo "[INFO] USER_SPARSE_COUNT (joint_v2): $USER_SPARSE_COUNT"
 
 run_nsys_profile() {
   local rep_base="$1"
@@ -145,12 +147,13 @@ run_nsys_profile() {
   return 0
 }
 
-echo "[0/5] Stage0 Export ONNX variants for converter + graph stats..."
+echo "[0/6] Stage0 Export ONNX variants for converter + graph stats..."
 BASE_ONNX="$ONNX_DIR/din_stage1_baseline.onnx"
 MS_ONNX="$ONNX_DIR/din_stage2_multislice.onnx"
 SEQ_ONLY_ONNX="$ONNX_DIR/din_stage3_emblayerseq_only.onnx"
 MS_SEQ_ONNX="$ONNX_DIR/din_stage4_multislice_emblayerseq.onnx"
 JOINT_ONNX="$ONNX_DIR/din_stage5_emblayer_joint.onnx"
+JOINT_V2_ONNX="$ONNX_DIR/din_stage6_emblayer_joint_v2.onnx"
 
 "$PYTHON_BIN" export_din_frozen_graph.py \
   --cpu \
@@ -184,7 +187,14 @@ JOINT_ONNX="$ONNX_DIR/din_stage5_emblayer_joint.onnx"
   --seq_ranges "$SEQ_RANGES" \
   > "$LOG_DIR/export_stage5.log" 2>&1
 
-echo "[1/5] Stage1 Profile baseline (padded)..."
+"$PYTHON_BIN" onnx_emblayer_joint_converter.py \
+  --input "$BASE_ONNX" \
+  --output "$JOINT_V2_ONNX" \
+  --vec_ranges "$VEC_RANGES" \
+  --seq_ranges "$SEQ_RANGES" \
+  > "$LOG_DIR/export_stage6.log" 2>&1
+
+echo "[1/6] Stage1 Profile baseline (padded)..."
 run_nsys_profile "$NSYS_DIR/stage1_baseline" "$LOG_DIR/stage1_baseline.log" \
   "$PYTHON_BIN" benchmark_dinemblayer_infer.py \
     --mode baseline \
@@ -200,7 +210,7 @@ run_nsys_profile "$NSYS_DIR/stage1_baseline" "$LOG_DIR/stage1_baseline.log" \
     $BENCH_RUNTIME_FLAG \
     $H2D_FLAG
 
-echo "[2/5] Stage2 Profile multislice..."
+echo "[2/6] Stage2 Profile multislice..."
 run_nsys_profile "$NSYS_DIR/stage2_multislice" "$LOG_DIR/stage2_multislice.log" \
   "$PYTHON_BIN" benchmark_dinemblayer_infer.py \
     --mode multislice \
@@ -216,7 +226,7 @@ run_nsys_profile "$NSYS_DIR/stage2_multislice" "$LOG_DIR/stage2_multislice.log" 
     $BENCH_RUNTIME_FLAG \
     $H2D_FLAG
 
-echo "[3/5] Stage3 Profile emblayerSeq only..."
+echo "[3/6] Stage3 Profile emblayerSeq only..."
 run_nsys_profile "$NSYS_DIR/stage3_emblayerseq_only" "$LOG_DIR/stage3_emblayerseq_only.log" \
   "$PYTHON_BIN" benchmark_dinemblayer_infer.py \
     --mode seq_only \
@@ -232,7 +242,7 @@ run_nsys_profile "$NSYS_DIR/stage3_emblayerseq_only" "$LOG_DIR/stage3_emblayerse
     $BENCH_RUNTIME_FLAG \
     $H2D_FLAG
 
-echo "[4/5] Stage4 Profile multislice+emblayerSeq..."
+echo "[4/6] Stage4 Profile multislice+emblayerSeq..."
 run_nsys_profile "$NSYS_DIR/stage4_multislice_emblayerseq" "$LOG_DIR/stage4_multislice_emblayerseq.log" \
   "$PYTHON_BIN" benchmark_dinemblayer_infer.py \
     --mode multislice_seq \
@@ -248,7 +258,7 @@ run_nsys_profile "$NSYS_DIR/stage4_multislice_emblayerseq" "$LOG_DIR/stage4_mult
     $BENCH_RUNTIME_FLAG \
     $H2D_FLAG
 
-echo "[5/5] Stage5 Profile emblayerSeq+emblayerVec..."
+echo "[5/6] Stage5 Profile emblayerSeq+emblayerVec..."
 run_nsys_profile "$NSYS_DIR/stage5_emblayer_joint" "$LOG_DIR/stage5_emblayer_joint.log" \
   "$PYTHON_BIN" benchmark_dinemblayer_infer.py \
     --mode joint \
@@ -264,7 +274,24 @@ run_nsys_profile "$NSYS_DIR/stage5_emblayer_joint" "$LOG_DIR/stage5_emblayer_joi
     $BENCH_RUNTIME_FLAG \
     $H2D_FLAG
 
-for name in stage1_baseline stage2_multislice stage3_emblayerseq_only stage4_multislice_emblayerseq stage5_emblayer_joint; do
+echo "[6/6] Stage6 Profile emblayerSeq+emblayerVecV2 (shared user features)..."
+run_nsys_profile "$NSYS_DIR/stage6_emblayer_joint_v2" "$LOG_DIR/stage6_emblayer_joint_v2.log" \
+  "$PYTHON_BIN" benchmark_dinemblayer_infer.py \
+    --mode joint_v2 \
+    --iters "$ITERS" \
+    --warmup "$WARMUP" \
+    --batch_size "$BATCH_SIZE" \
+    --max_seq_len "$MAX_SEQ_LEN" \
+    --avg_seq_len "$AVG_SEQ_LEN" \
+    --num_sparse "$NUM_SPARSE" \
+    --num_seq "$NUM_SEQ" \
+    --user_sparse_count "$USER_SPARSE_COUNT" \
+    --even_vocab_size "$EVEN_VOCAB_SIZE" \
+    --odd_vocab_size "$ODD_VOCAB_SIZE" \
+    $BENCH_RUNTIME_FLAG \
+    $H2D_FLAG
+
+for name in stage1_baseline stage2_multislice stage3_emblayerseq_only stage4_multislice_emblayerseq stage5_emblayer_joint stage6_emblayer_joint_v2; do
   "$NSYS_BIN" stats --force-export=true --report cuda_gpu_kern_sum,cuda_api_sum --format csv "$NSYS_DIR/$name.nsys-rep" > "$NSYS_DIR/$name.stats.csv"
 done
 
@@ -312,6 +339,13 @@ stage_info = {
       "nsys": "nsys/stage5_emblayer_joint.nsys-rep",
       "stats": "nsys/stage5_emblayer_joint.stats.csv",
     },
+    "stage6_emblayer_joint_v2": {
+        "title": "6) emblayerSeq + emblayerVecV2（user 侧共享压缩）",
+      "onnx": os.path.join(onnx_dir, "din_stage6_emblayer_joint_v2.onnx"),
+      "log": os.path.join(log_dir, "stage6_emblayer_joint_v2.log"),
+      "nsys": "nsys/stage6_emblayer_joint_v2.nsys-rep",
+      "stats": "nsys/stage6_emblayer_joint_v2.stats.csv",
+    },
 }
 
 
@@ -331,6 +365,19 @@ def first_match(text, patterns):
     return "N/A"
 
 
+def to_float_or_none(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def pct_improve_vs_base(base, cur):
+    if base is None or cur is None or base == 0.0:
+        return "N/A"
+    return f"{(base - cur) / base * 100.0:.2f}%"
+
+
 def onnx_summary(path):
     if not os.path.exists(path):
         return {"nodes": "N/A", "slice": "N/A", "multislice": "N/A", "emblayerseq": "N/A", "emblayervec": "N/A"}
@@ -347,32 +394,59 @@ def onnx_summary(path):
     }
 
 lines = []
-lines.append("# DIN 五种方式对比报告")
+lines.append("# DIN 六种方式对比报告")
 lines.append("")
 lines.append("本报告由 `examples/eval_din_emblayer_4way.sh` 自动生成。")
 lines.append("")
 lines.append("## 总览")
 lines.append("")
-lines.append("| Stage | Avg Latency (ms) | H2D-only (ms) | ONNX Nodes | Slice | MultiSlice | EmblayerSeq | EmblayerVec |")
+lines.append("| Stage | Avg Latency (ms) | H2D-only (ms) | Pure H2D (ms) | ONNX Nodes | Avg Latency相较于baseline的提升 | H2D-only相较于baseline的提升 | Pure H2D相较于baseline的提升 |")
 lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
-lines.append("| 0) 导出与图转换 | N/A | N/A | N/A | N/A | N/A | N/A | N/A |")
+
+baseline_txt = read_text(stage_info["stage1_baseline"]["log"])
+baseline_avg = first_match(baseline_txt, [
+  r"baseline avg latency \(ms\):\s*([0-9.]+)",
+  r"avg latency \(ms\):\s*([0-9.]+)",
+])
+baseline_h2d = first_match(baseline_txt, [
+  r"baseline h2d-only \(ms\):\s*([0-9.]+)",
+  r"h2d-only \(ms\):\s*([0-9.]+)",
+])
+baseline_h2d_pure = first_match(baseline_txt, [
+  r"baseline h2d-pure \(ms\):\s*([0-9.]+)",
+  r"h2d-pure \(ms\):\s*([0-9.]+)",
+])
+baseline_avg_v = to_float_or_none(baseline_avg)
+baseline_h2d_v = to_float_or_none(baseline_h2d)
+baseline_h2d_pure_v = to_float_or_none(baseline_h2d_pure)
 
 for key, info in stage_info.items():
     txt = read_text(info["log"])
     avg = first_match(txt, [
         r"baseline avg latency \(ms\):\s*([0-9.]+)",
         r"joint avg latency \(ms\):\s*([0-9.]+)",
+      r"joint_v2 avg latency \(ms\):\s*([0-9.]+)",
         r"hybrid avg latency \(ms\):\s*([0-9.]+)",
         r"avg latency \(ms\):\s*([0-9.]+)",
     ])
     h2d = first_match(txt, [
         r"baseline h2d-only \(ms\):\s*([0-9.]+)",
         r"joint h2d-only \(ms\):\s*([0-9.]+)",
+      r"joint_v2 h2d-only \(ms\):\s*([0-9.]+)",
         r"hybrid h2d-only \(ms\):\s*([0-9.]+)",
         r"h2d-only \(ms\):\s*([0-9.]+)",
     ])
+    h2d_pure = first_match(txt, [
+      r"baseline h2d-pure \(ms\):\s*([0-9.]+)",
+      r"joint h2d-pure \(ms\):\s*([0-9.]+)",
+      r"joint_v2 h2d-pure \(ms\):\s*([0-9.]+)",
+      r"h2d-pure \(ms\):\s*([0-9.]+)",
+    ])
+    avg_improve = pct_improve_vs_base(baseline_avg_v, to_float_or_none(avg))
+    h2d_improve = pct_improve_vs_base(baseline_h2d_v, to_float_or_none(h2d))
+    h2d_pure_improve = pct_improve_vs_base(baseline_h2d_pure_v, to_float_or_none(h2d_pure))
     s = onnx_summary(info["onnx"])
-    lines.append(f"| {info['title']} | {avg} | {h2d} | {s['nodes']} | {s['slice']} | {s['multislice']} | {s['emblayerseq']} | {s['emblayervec']} |")
+    lines.append(f"| {info['title']} | {avg} | {h2d} | {h2d_pure} | {s['nodes']} | {avg_improve} | {h2d_improve} | {h2d_pure_improve} |")
 
 lines.append("")
 lines.append("## 产物路径")
@@ -387,11 +461,13 @@ for _, info in stage_info.items():
 lines.append("")
 lines.append("## 说明")
 lines.append("")
-lines.append("- Stage0 使用 `export_din_frozen_graph.py` 导出 baseline/multislice ONNX，再通过 converter 生成 stage3/4/5 的真实推理 ONNX。")
-lines.append("- Stage2/Stage3/Stage4/Stage5 的 latency 分别来自对应 benchmark 脚本。")
+lines.append("- Stage0 使用 `export_din_frozen_graph.py` 导出 baseline/multislice ONNX，再通过 converter 生成 stage3/4/5/6 的真实推理 ONNX。")
+lines.append("- Stage2/Stage3/Stage4/Stage5/Stage6 的 latency 分别来自对应 benchmark 脚本。")
 lines.append("- Stage3 使用 `benchmark_dinemblayer_infer.py --mode seq_only`（运行时模式由 `BENCH_RUNTIME_MODE` 控制）。")
 lines.append("- Stage4 使用 `benchmark_dinemblayer_infer.py --mode multislice_seq`（MultiSlice + EmblayerSeq）。")
 lines.append("- Stage5 使用 `benchmark_dinemblayer_infer.py --mode joint`（EmblayerSeq + EmblayerVec）。")
+lines.append("- Stage6 使用 `benchmark_dinemblayer_infer.py --mode joint_v2`（EmblayerSeq + EmblayerVecV2，user 特征共享压缩）。")
+lines.append("- Stage6 额外参数 `USER_SPARSE_COUNT` 控制前多少个 sparse 特征按 user 共享处理。")
 lines.append("- `BENCH_RUNTIME_MODE=emblayer`（默认）会使用 `--rebuild_from_emblayer`，用于真实测 Emblayer runtime。")
 lines.append("- `BENCH_RUNTIME_MODE=scheduler` 会使用 `--scheduler_side_concat`，用于仅测调度侧已拼接输入场景。")
 

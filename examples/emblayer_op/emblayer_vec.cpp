@@ -9,6 +9,15 @@ torch::Tensor emblayer_vec_cuda(
     int64_t output_dim,
     double pad_value);
 
+torch::Tensor emblayer_vec_v2_cuda(
+  torch::Tensor user_values,
+  torch::Tensor user_feat_indices,
+  torch::Tensor item_values,
+  torch::Tensor item_prefix,
+  torch::Tensor item_feat_indices,
+  int64_t output_dim,
+  double pad_value);
+
 torch::Tensor emblayer_vec_fast(
     torch::Tensor vec_values,
     torch::Tensor prefix,
@@ -32,6 +41,49 @@ torch::Tensor emblayer_vec_fast(
   TORCH_CHECK(feat_indices.is_contiguous(), "feat_indices must be contiguous");
 
   return emblayer_vec_cuda(vec_values, prefix, feat_indices, output_dim, pad_value);
+}
+
+torch::Tensor emblayer_vec_v2_fast(
+    torch::Tensor user_values,
+    torch::Tensor user_feat_indices,
+    torch::Tensor item_values,
+    torch::Tensor item_prefix,
+    torch::Tensor item_feat_indices,
+    int64_t output_dim,
+    double pad_value) {
+  TORCH_CHECK(user_values.is_cuda(), "user_values must be CUDA");
+  TORCH_CHECK(user_feat_indices.is_cuda(), "user_feat_indices must be CUDA");
+  TORCH_CHECK(item_values.is_cuda(), "item_values must be CUDA");
+  TORCH_CHECK(item_prefix.is_cuda(), "item_prefix must be CUDA");
+  TORCH_CHECK(item_feat_indices.is_cuda(), "item_feat_indices must be CUDA");
+
+  TORCH_CHECK(user_values.dim() == 1, "user_values must be 1D");
+  TORCH_CHECK(user_feat_indices.dim() == 1, "user_feat_indices must be 1D");
+  TORCH_CHECK(item_values.dim() == 1, "item_values must be 1D");
+  TORCH_CHECK(item_prefix.dim() == 1, "item_prefix must be 1D");
+  TORCH_CHECK(item_feat_indices.dim() == 1, "item_feat_indices must be 1D");
+
+  TORCH_CHECK(item_prefix.scalar_type() == torch::kInt64, "item_prefix must be int64 in fast path");
+  TORCH_CHECK(user_feat_indices.scalar_type() == torch::kInt64, "user_feat_indices must be int64 in fast path");
+  TORCH_CHECK(item_feat_indices.scalar_type() == torch::kInt64, "item_feat_indices must be int64 in fast path");
+
+  TORCH_CHECK(user_feat_indices.numel() == user_values.numel(), "user_feat_indices size must equal user_values size");
+  TORCH_CHECK(item_feat_indices.numel() == item_values.numel(), "item_feat_indices size must equal item_values size");
+  TORCH_CHECK(item_prefix.numel() >= 2, "item_prefix must have size >= 2");
+
+  TORCH_CHECK(user_feat_indices.is_contiguous(), "user_feat_indices must be contiguous");
+  TORCH_CHECK(item_prefix.is_contiguous(), "item_prefix must be contiguous");
+  TORCH_CHECK(item_feat_indices.is_contiguous(), "item_feat_indices must be contiguous");
+  TORCH_CHECK(output_dim > 0, "output_dim must be > 0");
+
+  return emblayer_vec_v2_cuda(
+      user_values,
+      user_feat_indices,
+      item_values,
+      item_prefix,
+      item_feat_indices,
+      output_dim,
+      pad_value);
 }
 
 torch::Tensor emblayer_vec(
@@ -108,4 +160,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("output_dim"),
       py::arg("pad_value") = 0.0,
       "emblayerVec fast path: metadata already on CUDA int64 tensors");
+
+    m.def(
+      "emblayer_vec_v2_fast",
+      &emblayer_vec_v2_fast,
+      py::arg("user_values"),
+      py::arg("user_feat_indices"),
+      py::arg("item_values"),
+      py::arg("item_prefix"),
+      py::arg("item_feat_indices"),
+      py::arg("output_dim"),
+      py::arg("pad_value") = 0.0,
+      "emblayerVec V2 fast path: user features are shared across batch and item features are row-wise compressed");
 }
