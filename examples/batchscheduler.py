@@ -43,7 +43,23 @@ def _parse_float_list(text: str) -> List[float]:
         token = token.strip()
         if not token:
             continue
-        values.append(float(token))
+        if ':' in token:
+            parts = [p.strip() for p in token.split(':')]
+            if len(parts) != 3:
+                raise ValueError(f"invalid arrival_rates range token: '{token}', expected start:end:step")
+            start = float(parts[0])
+            end = float(parts[1])
+            step = float(parts[2])
+            if step <= 0:
+                raise ValueError('arrival_rates range step must be > 0')
+            if end < start:
+                raise ValueError('arrival_rates range end must be >= start')
+            cur = start
+            while cur <= end + 1e-12:
+                values.append(cur)
+                cur += step
+        else:
+            values.append(float(token))
     if not values:
         raise ValueError('arrival_rates cannot be empty')
     return values
@@ -331,16 +347,16 @@ def _write_report(path: str, p99_target_ms: float, sweep: List[RunResult], best:
     lines.append('')
     lines.append(f'- p99 约束: <= {p99_target_ms:.1f} ms')
     lines.append('')
-    lines.append('## p99<=100ms 下最大吞吐')
+    lines.append(f'## p99<={p99_target_ms:.1f}ms 下最大吞吐')
     lines.append('')
-    lines.append('| Mode | Arrival Rate | Max Throughput (QPS) | Avg Latency (ms) | p99 (ms) | Avg Batch | Queue (ms) | H2D Bubble (ms) | H2D Bubble Ratio (%) | SM Util (%) | GPU Util (%) |')
-    lines.append('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    lines.append('| Mode | Arrival Rate | Max Throughput (QPS) | Avg Latency (ms) | p99 (ms) | Avg Batch | Queue (ms) | Avg H2D-only (ms) | H2D Bubble (ms) | H2D Bubble Ratio (%) | SM Util (%) | GPU Util (%) |')
+    lines.append('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
     for r in best:
         if r is None:
             continue
         lines.append(
             f"| {r.mode} | {r.arrival_rate:.1f} | {r.throughput_qps:.1f} | {r.avg_ms:.3f} | {r.p99_ms:.3f} | "
-            f"{r.avg_batch_size:.2f} | {r.avg_queue_ms:.3f} | {r.h2d_bubble_ms:.4f} | {r.h2d_bubble_ratio_pct:.2f}% | "
+            f"{r.avg_batch_size:.2f} | {r.avg_queue_ms:.3f} | {r.avg_h2d_only_ms:.4f} | {r.h2d_bubble_ms:.4f} | {r.h2d_bubble_ratio_pct:.2f}% | "
             f"{r.sm_util_avg_pct if r.sm_util_avg_pct is not None else 'N/A'} | {r.gpu_util_avg_pct if r.gpu_util_avg_pct is not None else 'N/A'} |"
         )
 
@@ -438,11 +454,16 @@ def main():
                 f"mode={res.mode} rate={rate:.1f} qps={res.throughput_qps:.1f} p99={res.p99_ms:.3f} "
                 f"avg_batch={res.avg_batch_size:.2f} sm={res.sm_util_avg_pct} gpu={res.gpu_util_avg_pct}")
             
-            # 击穿点检测：如果 baseline 的 p99 已经超过目标的 3 倍，认为后续更高的负载下 baseline 不可能满足 p99 约束，提前停止 baseline 的 sweep
-            if mode == 'baseline' and res.p99_ms > 3*args.p99_target_ms :
-                print(
-                    f"[INFO] baseline p99={res.p99_ms:.3f} exceeds target {args.p99_target_ms:.1f}ms, "
-                    "stop baseline sweep and continue with experimental group")
+            # 击穿点检测：当当前模式 p99 超过目标 3 倍时，提前停止该模式的后续更高负载 sweep
+            if res.p99_ms > 3 * args.p99_target_ms:
+                if mode == 'baseline':
+                    print(
+                        f"[INFO] baseline p99={res.p99_ms:.3f} exceeds target {args.p99_target_ms:.1f}ms, "
+                        "stop baseline sweep and continue with experimental group")
+                elif mode == 'joint_v2':
+                    print(
+                        f"[INFO] emblayerV2 p99={res.p99_ms:.3f} exceeds target {args.p99_target_ms:.1f}ms, "
+                        "stop emblayerV2 sweep")
                 break
 
     best_rows = []

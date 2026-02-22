@@ -299,6 +299,8 @@ done
 import os
 import re
 import sys
+import csv
+from io import StringIO
 import onnx
 
 onnx_dir, log_dir, report_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -372,10 +374,63 @@ def to_float_or_none(x):
         return None
 
 
+def to_int_or_none(x):
+  try:
+    return int(float(x))
+  except (TypeError, ValueError):
+    return None
+
+
 def pct_improve_vs_base(base, cur):
     if base is None or cur is None or base == 0.0:
         return "N/A"
     return f"{(base - cur) / base * 100.0:.2f}%"
+
+
+def parse_h2d_bytes(log_text):
+  m = re.search(
+    r"h2d-bytes total\(B\):\s*(\d+)\s+data\(B\):\s*(\d+)\s+meta\(B\):\s*(\d+)",
+    log_text,
+  )
+  if not m:
+    return "N/A", "N/A", "N/A"
+  return m.group(1), m.group(2), m.group(3)
+
+
+def parse_kernel_launch_count(stats_path):
+  text = read_text(stats_path)
+  if not text:
+    return "N/A"
+
+  in_instances_table = False
+  total_instances = 0
+  found_instances_header = False
+
+  for line in text.splitlines():
+    stripped = line.strip()
+    if not stripped:
+      continue
+    if stripped.startswith('Time (%)') and ',Instances,' in stripped:
+      in_instances_table = True
+      found_instances_header = True
+      continue
+    if stripped.startswith('Time (%)') and ',Num Calls,' in stripped:
+      in_instances_table = False
+      continue
+    if stripped.startswith('Processing ['):
+      continue
+
+    if in_instances_table and re.match(r'^\d', stripped):
+      try:
+        row = next(csv.reader(StringIO(stripped)))
+        if len(row) >= 3:
+          total_instances += int(float(row[2]))
+      except Exception:
+        continue
+
+  if not found_instances_header:
+    return "N/A"
+  return str(total_instances)
 
 
 def onnx_summary(path):
@@ -400,8 +455,8 @@ lines.append("本报告由 `examples/eval_din_emblayer_4way.sh` 自动生成。"
 lines.append("")
 lines.append("## 总览")
 lines.append("")
-lines.append("| Stage | Avg Latency (ms) | H2D-only (ms) | Pure H2D (ms) | ONNX Nodes | Avg Latency相较于baseline的提升 | H2D-only相较于baseline的提升 | Pure H2D相较于baseline的提升 |")
-lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+lines.append("| Stage | Avg Latency (ms) | H2D-only (ms) | Pure H2D (ms) | H2D Total (B) | H2D Data (B) | H2D Meta (B) | Kernel Launches | ONNX Nodes | Avg Latency提升 | H2D-only提升 | Pure H2D提升 | H2D Total提升 | H2D Data提升 | H2D Meta提升 | Kernel Launches提升 |")
+lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
 baseline_txt = read_text(stage_info["stage1_baseline"]["log"])
 baseline_avg = first_match(baseline_txt, [
@@ -416,9 +471,15 @@ baseline_h2d_pure = first_match(baseline_txt, [
   r"baseline h2d-pure \(ms\):\s*([0-9.]+)",
   r"h2d-pure \(ms\):\s*([0-9.]+)",
 ])
+baseline_total_b, baseline_data_b, baseline_meta_b = parse_h2d_bytes(baseline_txt)
 baseline_avg_v = to_float_or_none(baseline_avg)
 baseline_h2d_v = to_float_or_none(baseline_h2d)
 baseline_h2d_pure_v = to_float_or_none(baseline_h2d_pure)
+baseline_total_b_v = to_int_or_none(baseline_total_b)
+baseline_data_b_v = to_int_or_none(baseline_data_b)
+baseline_meta_b_v = to_int_or_none(baseline_meta_b)
+baseline_kernel_launches = parse_kernel_launch_count(os.path.join(os.path.dirname(report_path), stage_info["stage1_baseline"]["stats"]))
+baseline_kernel_launches_v = to_int_or_none(baseline_kernel_launches)
 
 for key, info in stage_info.items():
     txt = read_text(info["log"])
@@ -442,11 +503,20 @@ for key, info in stage_info.items():
       r"joint_v2 h2d-pure \(ms\):\s*([0-9.]+)",
       r"h2d-pure \(ms\):\s*([0-9.]+)",
     ])
+    total_b, data_b, meta_b = parse_h2d_bytes(txt)
+    kernel_launches = parse_kernel_launch_count(os.path.join(os.path.dirname(report_path), info["stats"]))
     avg_improve = pct_improve_vs_base(baseline_avg_v, to_float_or_none(avg))
     h2d_improve = pct_improve_vs_base(baseline_h2d_v, to_float_or_none(h2d))
     h2d_pure_improve = pct_improve_vs_base(baseline_h2d_pure_v, to_float_or_none(h2d_pure))
+    total_b_improve = pct_improve_vs_base(baseline_total_b_v, to_int_or_none(total_b))
+    data_b_improve = pct_improve_vs_base(baseline_data_b_v, to_int_or_none(data_b))
+    meta_b_improve = pct_improve_vs_base(baseline_meta_b_v, to_int_or_none(meta_b))
+    kernel_launch_improve = pct_improve_vs_base(baseline_kernel_launches_v, to_int_or_none(kernel_launches))
     s = onnx_summary(info["onnx"])
-    lines.append(f"| {info['title']} | {avg} | {h2d} | {h2d_pure} | {s['nodes']} | {avg_improve} | {h2d_improve} | {h2d_pure_improve} |")
+    lines.append(
+        f"| {info['title']} | {avg} | {h2d} | {h2d_pure} | {total_b} | {data_b} | {meta_b} | {kernel_launches} | {s['nodes']} | "
+        f"{avg_improve} | {h2d_improve} | {h2d_pure_improve} | {total_b_improve} | {data_b_improve} | {meta_b_improve} | {kernel_launch_improve} |"
+    )
 
 lines.append("")
 lines.append("## 产物路径")

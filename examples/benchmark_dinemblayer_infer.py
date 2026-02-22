@@ -800,6 +800,27 @@ def pure_h2d_only_ms(mode, host_data, device, iters, warmup, scheduler_side_conc
     return (t1 - t0) * 1000.0 / iters
 
 
+def h2d_bytes_breakdown(mode, host_data, scheduler_side_concat):
+    host_inputs = _prepare_host_inputs_for_copy(mode, host_data, scheduler_side_concat)
+    total_bytes = 0
+    data_bytes = 0
+    meta_bytes = 0
+
+    for tensor in host_inputs.values():
+        bytes_cur = int(tensor.numel() * tensor.element_size())
+        total_bytes += bytes_cur
+        if tensor.dtype.is_floating_point:
+            data_bytes += bytes_cur
+        else:
+            meta_bytes += bytes_cur
+
+    return {
+        'total': int(total_bytes),
+        'data': int(data_bytes),
+        'meta': int(meta_bytes),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Unified 5-stage benchmark for DIN Emblayer optimizations')
     parser.add_argument('--mode', type=str, choices=['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint', 'joint_v2', 'all'], default='all')
@@ -983,6 +1004,12 @@ def main():
         outputs[mode] = y
         e2e[mode] = e2e_ms
         print(f'{mode} avg latency (ms):', round(e2e_ms, 6))
+
+        h2d_bytes = h2d_bytes_breakdown(mode, host_data, args.scheduler_side_concat)
+        print(
+            f"{mode} h2d-bytes total(B): {h2d_bytes['total']} "
+            f"data(B): {h2d_bytes['data']} meta(B): {h2d_bytes['meta']}"
+        )
 
         if args.include_h2d:
             h2d_ms = h2d_only_ms(mode, host_data, device, args.iters, args.warmup, args.scheduler_side_concat)
