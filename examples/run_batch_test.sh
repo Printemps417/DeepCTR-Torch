@@ -1,7 +1,7 @@
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 /root/autodl-tmp/myenv/bin/python batchscheduler.py \
-        --arrival_rates 2500:2600:10 \
+    --arrival_rates 2500:2600:10 \
 	--p99_target_ms 3000 \
 	--duration_s 60 \
 	--max_batch_size 256 \
@@ -11,7 +11,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 	--user_sparse_count 260 \
 	--even_vocab_size 4096 --odd_vocab_size 64 \
 	--modes baseline,multislice,emblayerV1,emblayerV2 \
-	--out_dir ./batchscheduler_outputs_iobound_4mode
+	--out_dir ./batchscheduler_outputs_iobound_4mode_test
 
 # /root/autodl-tmp/myenv/bin/python batchscheduler.py \
 # 	--arrival_rates 800,1200,1600,2000,2400 \

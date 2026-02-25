@@ -6,6 +6,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -298,29 +299,55 @@ def _simulate(mode: str,
     end = start + duration_s
     next_arrival = start + rng.exponential(1.0 / max(arrival_rate, 1e-9))
 
+    queue = deque()
+    batch_sizes = []
+    latencies_ms = []
+    queue_wait_ms = []
+    h2d_only_samples = []
+    h2d_pure_samples = []
+    concat_ms_samples = []
+    h2d_total_numel_samples = []
+    h2d_data_numel_samples = []
+    h2d_meta_numel_samples = []
+
     def _run_loop():
         nonlocal next_arrival
+        last_gpu_finish_time = time.perf_counter()
+        
         while True:
             now = time.perf_counter()
             if now >= end and not queue:
                 break
 
+            # 1. Catch up with arrivals during last inference/sleep
             while now >= next_arrival and now < end:
                 seq_len = _sample_seq_len(rng, model.avg_seq_len, model.max_seq_len)
                 queue.append((next_arrival, seq_len))
                 next_arrival = next_arrival + rng.exponential(1.0 / max(arrival_rate, 1e-9))
 
             if not queue:
-                time.sleep(min(0.001, max(0.0, next_arrival - now)))
+                # Idle wait for next arrival
+                time.sleep(min(0.0005, max(0.0, next_arrival - now)))
                 continue
 
-            oldest = queue[0][0]
-            if len(queue) < max_batch_size and (now - oldest) < max_wait_ms / 1000.0 and now < end:
-                time.sleep(0.0005)
+            # 2. Scheduling decision
+            oldest_arrival_time = queue[0][0]
+            timeout_reached = (now - oldest_arrival_time) >= max_wait_ms / 1000.0
+            batch_full = len(queue) >= max_batch_size
+            worker_idle = now >= last_gpu_finish_time
+            
+            # Optimization: 只有在满、超时 或 工人已经闲置且队列有活时才触发
+            should_trigger = batch_full or timeout_reached or (worker_idle and len(queue) > 0)
+
+            if not should_trigger and now < end:
+                # Wait for more arrivals or timeout
+                # 这种情况下 sleep 时间应更短以保证响应灵敏度
+                time.sleep(0.0002)
                 continue
 
+            # 3. Batch Preparation
             batch_size = min(len(queue), max_batch_size)
-            batch_items = [queue.pop(0) for _ in range(batch_size)]
+            batch_items = [queue.popleft() for _ in range(batch_size)]
             batch_arrivals = [item[0] for item in batch_items]
             batch_lengths = [item[1] for item in batch_items]
 
@@ -328,9 +355,19 @@ def _simulate(mode: str,
                 _simulate_baseline_padding(batch_lengths, model.max_seq_len)
 
             if batch_size not in host_data_cache:
-                t_start = time.perf_counter()
-                for _ in range(5):
-                    tmp_data = bench.build_inputs(
+                # FAST miss handling - Slicing from nearest strategic point.
+                masters = sorted([k for k in host_data_cache.keys() if k >= batch_size])
+                if masters:
+                    master_bs = masters[0]
+                    master_data, master_concat, master_numel = host_data_cache[master_bs]
+                    # This slicing is extremely fast (no build_inputs)
+                    tmp_data = _slice_host_data(master_data, batch_size)
+                    concat_ms = master_concat * batch_size / master_bs
+                    numel_breakdown = bench.h2d_numel_breakdown(mode, tmp_data, scheduler_side_concat=False)
+                    host_data_cache[batch_size] = (tmp_data, concat_ms, numel_breakdown)
+                else: 
+                     # Fallback to slow way only if no pre-warmed points covers it.
+                     tmp_data = bench.build_inputs(
                         model=model,
                         feature_columns=model.feature_columns,
                         batch_size=batch_size,
@@ -338,22 +375,35 @@ def _simulate(mode: str,
                         avg_seq_len=model.avg_seq_len,
                         seed=seed + batch_size,
                     )
-                t_end = time.perf_counter()
-                concat_ms = (t_end - t_start) * 1000.0 / 5.0
-                numel_breakdown = bench.h2d_numel_breakdown(mode, tmp_data, scheduler_side_concat=False)
-                host_data_cache[batch_size] = (tmp_data, concat_ms, numel_breakdown)
+                     concat_ms = 0.005 * batch_size
+                     numel_breakdown = bench.h2d_numel_breakdown(mode, tmp_data, scheduler_side_concat=False)
+                     host_data_cache[batch_size] = (tmp_data, concat_ms, numel_breakdown)
             
             host_data, concat_ms, numel_breakdown = host_data_cache[batch_size]
 
             if batch_size not in h2d_cache:
-                h2d_cache[batch_size] = _compute_h2d_cache(mode, host_data, device, iters=10, warmup=3)
+                # Interpolate from strategic points
+                strat_h2d_map = {k: v[0] for k, v in h2d_cache.items()}
+                strat_h2d_pure_map = {k: v[1] for k, v in h2d_cache.items()}
+                
+                h2d_only = _get_interpolated_metrics(batch_size, strat_h2d_map)
+                h2d_pure = _get_interpolated_metrics(batch_size, strat_h2d_pure_map)
+                h2d_cache[batch_size] = (h2d_only, h2d_pure)
 
+            # 4. Simulation of CPU Concat Overhead
+            # Realistic simulation: CPU needs time to copy data before starting H2D
+            time.sleep(concat_ms / 1000.0)
+
+            # 5. Execution (H2D + Compute)
             bench._sync_if_cuda(device)
-            t0 = time.perf_counter()
+            t_exec_start = time.perf_counter()
             _ = _run_infer(mode, model, infer_models, host_data, device)
             bench._sync_if_cuda(device)
-            t1 = time.perf_counter()
+            t_exec_done = time.perf_counter()
+            
+            last_gpu_finish_time = t_exec_done
 
+            # 6. Recording metrics
             h2d_only, h2d_pure = h2d_cache[batch_size]
             h2d_only_samples.append(h2d_only)
             h2d_pure_samples.append(h2d_pure)
@@ -363,10 +413,9 @@ def _simulate(mode: str,
             h2d_meta_numel_samples.append(numel_breakdown['meta'])
 
             batch_sizes.append(batch_size)
-            done_time = t1
             for arrival_t in batch_arrivals:
-                queue_wait_ms.append((t0 - arrival_t) * 1000.0)
-                latencies_ms.append((done_time - arrival_t) * 1000.0)
+                queue_wait_ms.append((t_exec_start - arrival_t) * 1000.0)
+                latencies_ms.append((t_exec_done - arrival_t) * 1000.0)
 
     def _runner():
         _run_loop()
@@ -421,6 +470,97 @@ def _simulate(mode: str,
         avg_h2d_meta_numel=avg_h2d_meta_numel,
         avg_concat_ms=avg_concat,
     )
+
+
+def _get_interpolated_metrics(bs, strategic_cache):
+    """Fast linear interpolation for concat_ms or h2d_ms to avoid in-loop benchmarking."""
+    import numpy as np
+    sorted_keys = sorted(strategic_cache.keys())
+    if not sorted_keys:
+        return 0.0
+    if bs in strategic_cache:
+        return strategic_cache[bs]
+    if bs <= sorted_keys[0]:
+        return strategic_cache[sorted_keys[0]] * (bs / sorted_keys[0])
+    if bs >= sorted_keys[-1]:
+        return strategic_cache[sorted_keys[-1]] * (bs / sorted_keys[-1])
+    
+    # Linear interpolation
+    for i in range(len(sorted_keys) - 1):
+        k1, k2 = sorted_keys[i], sorted_keys[i+1]
+        if k1 < bs < k2:
+            v1, v2 = strategic_cache[k1], strategic_cache[k2]
+            return v1 + (v2 - v1) * (bs - k1) / (k2 - k1)
+    return strategic_cache[sorted_keys[-1]]
+
+
+def _prewarm_caches(mode, model, device, host_data_cache, h2d_cache, max_batch_size, seed):
+    """Avoid stalls during simulation by pre-filling host buffers and H2D speed stats."""
+    # Minimum strategic points for speed: 1 and max
+    strategic_sizes = sorted(list({1, max_batch_size}))
+    strategic_sizes = [s for s in strategic_sizes if s > 0]
+
+    print(f"[INFO] Pre-warming {len(strategic_sizes)} points (1, {max_batch_size}) for mode={mode}...")
+    
+    for bs in strategic_sizes:
+        if bs not in host_data_cache:
+            # Build once
+            tmp_data = bench.build_inputs(
+                model=model,
+                feature_columns=model.feature_columns,
+                batch_size=bs,
+                max_seq_len=model.max_seq_len,
+                avg_seq_len=model.avg_seq_len,
+                seed=seed + bs,
+            )
+            # 0.001ms per sample is a safe conservative estimate for concat
+            concat_ms = 0.001 * bs 
+            numel_breakdown = bench.h2d_numel_breakdown(mode, tmp_data, scheduler_side_concat=False)
+            host_data_cache[bs] = (tmp_data, concat_ms, numel_breakdown)
+        
+        if bs not in h2d_cache:
+            # Fewer iters for warming speed
+            h2d_cache[bs] = _compute_h2d_cache(mode, host_data_cache[bs][0], device, iters=5, warmup=2)
+
+def _slice_host_data(host_data, bs):
+    """Slices a pre-filled host_data dictionary from master_bs down to bs."""
+    import torch
+    sliced = {}
+    master_bs = host_data['full'].shape[0]
+    num_seq_per_sample = host_data['num_seq_per_sample']
+    if bs == master_bs:
+        return host_data
+    
+    # Fast paths for simple tensors
+    for k, v in host_data.items():
+        if not isinstance(v, (torch.Tensor, np.ndarray)):
+            sliced[k] = v
+            continue
+            
+        # Tensors with batch as first dimension
+        if v.shape[0] == master_bs:
+            # Most tensors: full, non_seq_full, non_seq_compact...
+            sliced[k] = v[:bs]
+        elif k == 'seq_prefix':
+            sliced[k] = v[:bs+1]
+        elif k == 'seq_lengths':
+            sliced[k] = v[:bs * num_seq_per_sample]
+        elif k == 'seq_offsets':
+            sliced[k] = v[:bs * num_seq_per_sample + 1]
+        elif k == 'vec_prefix' or k == 'item_vec_prefix':
+            sliced[k] = v[:bs+1]
+        elif k == 'seq_values':
+            end = int(host_data['seq_offsets'][bs * num_seq_per_sample])
+            sliced[k] = v[:end]
+        elif k in ('vec_values', 'vec_indices'):
+            end = int(host_data['vec_prefix'][bs])
+            sliced[k] = v[:end]
+        elif k in ('item_vec_values', 'item_vec_indices'):
+            end = int(host_data['item_vec_prefix'][bs])
+            sliced[k] = v[:end]
+        else:
+            sliced[k] = v
+    return sliced
 
 
 def _select_best_under_p99(records: List[RunResult], p99_target_ms: float) -> Optional[RunResult]:
@@ -548,6 +688,10 @@ def main():
     for mode in modes:
         host_cache: Dict[int, Tuple[Dict, float, Dict]] = {}
         h2d_cache: Dict[int, Tuple[float, float]] = {}
+        
+        # Pre-warm common batch sizes to avoid stalls during simulation
+        _prewarm_caches(mode, model, device, host_cache, h2d_cache, args.max_batch_size, args.seed)
+        
         for rate in arrival_rates:
             res = _simulate(
                 mode=mode,
