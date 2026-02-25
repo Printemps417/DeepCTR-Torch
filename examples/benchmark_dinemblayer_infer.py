@@ -800,19 +800,40 @@ def pure_h2d_only_ms(mode, host_data, device, iters, warmup, scheduler_side_conc
     return (t1 - t0) * 1000.0 / iters
 
 
+def h2d_numel_breakdown(mode, host_data, scheduler_side_concat):
+    host_inputs = _prepare_host_inputs_for_copy(mode, host_data, scheduler_side_concat)
+    total_numel = 0
+    data_numel = 0
+    meta_numel = 0
+
+    for name, tensor in host_inputs.items():
+        numel_cur = int(tensor.numel())
+        total_numel += numel_cur
+        if 'prefix' in name or 'lengths' in name or 'offsets' in name or 'indices' in name:
+            meta_numel += numel_cur
+        else:
+            data_numel += numel_cur
+
+    return {
+        'total': int(total_numel),
+        'data': int(data_numel),
+        'meta': int(meta_numel),
+    }
+
+
 def h2d_bytes_breakdown(mode, host_data, scheduler_side_concat):
     host_inputs = _prepare_host_inputs_for_copy(mode, host_data, scheduler_side_concat)
     total_bytes = 0
     data_bytes = 0
     meta_bytes = 0
 
-    for tensor in host_inputs.values():
+    for name, tensor in host_inputs.items():
         bytes_cur = int(tensor.numel() * tensor.element_size())
         total_bytes += bytes_cur
-        if tensor.dtype.is_floating_point:
-            data_bytes += bytes_cur
-        else:
+        if 'prefix' in name or 'lengths' in name or 'offsets' in name or 'indices' in name:
             meta_bytes += bytes_cur
+        else:
+            data_bytes += bytes_cur
 
     return {
         'total': int(total_bytes),
@@ -869,6 +890,7 @@ def main():
     if args.user_sparse_count < 0 or args.user_sparse_count > args.num_sparse:
         raise ValueError('--user_sparse_count must be in [0, num_sparse]')
     model.user_sparse_count_for_emblayer_v2 = int(args.user_sparse_count)
+    build_t0 = time.perf_counter()
     host_data = build_inputs(
         model=model,
         feature_columns=feature_columns,
@@ -876,6 +898,8 @@ def main():
         max_seq_len=args.max_seq_len,
         avg_seq_len=args.avg_seq_len,
     )
+    build_t1 = time.perf_counter()
+    host_build_ms = (build_t1 - build_t0) * 1000.0
 
     print('device:', device)
     print('batch_size:', args.batch_size)
@@ -885,6 +909,7 @@ def main():
     print('include_h2d:', args.include_h2d)
     print('scheduler_side_concat:', args.scheduler_side_concat)
     print('user_sparse_count(emblayerV2):', args.user_sparse_count)
+    print('host_data_build(ms):', round(host_build_ms, 6))
     for key in ['baseline', 'multislice', 'multislice_seq', 'seq_only', 'joint', 'joint_v2']:
         if args.scheduler_side_concat and key in ('multislice_seq', 'seq_only', 'joint', 'joint_v2'):
             print(f'input_bytes {key}:', host_data['bytes']['baseline'])
@@ -1018,7 +1043,9 @@ def main():
             h2d_pure_ms = pure_h2d_only_ms(mode, host_data, device, args.iters, args.warmup, args.scheduler_side_concat)
             h2d_pure[mode] = h2d_pure_ms
             print(f'{mode} h2d-pure (ms):', round(h2d_pure_ms, 6))
-            print(f'{mode} h2d-prepare-overhead(ms):', round(max(h2d_ms - h2d_pure_ms, 0.0), 6))
+            feature_concat_prepare_ms = max(h2d_ms - h2d_pure_ms, 0.0)
+            print(f'{mode} h2d-prepare-overhead(ms):', round(feature_concat_prepare_ms, 6))
+            print(f'{mode} feature-concat-prepare(ms):', round(feature_concat_prepare_ms, 6))
             print(f'{mode} est-compute(ms):', round(max(e2e_ms - h2d_ms, 0.0), 6))
 
     if 'baseline' in outputs:

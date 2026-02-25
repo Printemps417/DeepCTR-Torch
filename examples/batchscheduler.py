@@ -35,6 +35,32 @@ class RunResult:
     h2d_bubble_ratio_pct: float
     sm_util_avg_pct: Optional[float]
     gpu_util_avg_pct: Optional[float]
+    avg_h2d_total_numel: float
+    avg_h2d_data_numel: float
+    avg_h2d_meta_numel: float
+    avg_concat_ms: float
+
+
+MODE_DISPLAY = {
+    'baseline': 'baseline',
+    'multislice': 'multislice',
+    'joint': 'emblayerV1',
+    'joint_v2': 'emblayerV2',
+}
+
+MODE_ALIASES = {
+    'baseline': 'baseline',
+    'multislice': 'multislice',
+    'emblayer': 'joint',
+    'emblayerv1': 'joint',
+    'emblayer_v1': 'joint',
+    'v1': 'joint',
+    'emblayerv2': 'joint_v2',
+    'emblayer_v2': 'joint_v2',
+    'v2': 'joint_v2',
+}
+
+DEFAULT_MODE_ORDER = ('baseline', 'multislice', 'joint', 'joint_v2')
 
 
 def _parse_float_list(text: str) -> List[float]:
@@ -77,28 +103,84 @@ def _parse_int_list(text: str) -> List[int]:
     return values
 
 
-def _build_infer_models(model, host_data_meta, device: str):
+def _parse_modes(text: str) -> List[str]:
+    if not text:
+        return list(DEFAULT_MODE_ORDER)
+
+    raw_tokens = [tok.strip() for tok in text.split(',') if tok.strip()]
+    if not raw_tokens:
+        return list(DEFAULT_MODE_ORDER)
+
+    modes: List[str] = []
+    seen = set()
+    for token in raw_tokens:
+        key = token.lower()
+        if key not in MODE_ALIASES:
+            valid = ', '.join(sorted(MODE_ALIASES))
+            raise ValueError(f"unknown mode '{token}', expected one of: {valid}")
+        mode = MODE_ALIASES[key]
+        if mode not in seen:
+            seen.add(mode)
+            modes.append(mode)
+
+    return modes
+
+
+def _build_infer_models(model, host_data_meta, device: str, modes: List[str]):
     infer_models = {}
     input_spans = [model.feature_index[name] for name in model.feature_index]
     input_spans = sorted(input_spans, key=lambda x: x[0])
-    infer_models['baseline'] = bench.DINBaselinePerInputSlice(
-        model=model,
-        input_spans=input_spans,
-    ).to(device).eval()
+
+    if 'baseline' in modes:
+        infer_models['baseline'] = bench.DINBaselinePerInputSlice(
+            model=model,
+            input_spans=input_spans,
+        ).to(device).eval()
     infer_models['baseline_raw'] = model
 
-    seq_ext = bench.load_emblayer_seq_extension()
-    vec_ext = bench.load_emblayer_vec_extension()
+    multislice_ext = None
+    if 'multislice' in modes:
+        multislice_ext = bench.load_multislice_extension()
+        infer_models['multislice'] = bench.DINMultiSliceInfer(
+            model=model,
+            compact_layout=host_data_meta['compact_layout'],
+            starts=host_data_meta['starts'],
+            span_lengths=host_data_meta['span_lengths'],
+            multislice_ext=multislice_ext,
+        ).to(device).eval()
 
-    infer_models['joint_v2'] = bench.DINJointInferV2(
-        model=model,
-        seq_feature_info=host_data_meta['seq_feature_info'],
-        input_dim=host_data_meta['input_dim'],
-        num_seq_per_sample=host_data_meta['num_seq_per_sample'],
-        max_seq_len=host_data_meta['max_seq_len'],
-        emblayer_seq_ext=seq_ext,
-        emblayer_vec_ext=vec_ext,
-    ).to(device).eval()
+    seq_ext = None
+    vec_ext = None
+    if any(m in ('joint', 'joint_v2') for m in modes):
+        seq_ext = bench.load_emblayer_seq_extension()
+    if 'joint' in modes or 'joint_v2' in modes:
+        vec_ext = bench.load_emblayer_vec_extension()
+
+    if 'joint' in modes:
+        infer_models['joint'] = bench.DINJointInfer(
+            model=model,
+            seq_feature_info=host_data_meta['seq_feature_info'],
+            input_dim=host_data_meta['input_dim'],
+            num_seq_per_sample=host_data_meta['num_seq_per_sample'],
+            max_seq_len=host_data_meta['max_seq_len'],
+            emblayer_seq_ext=seq_ext,
+            emblayer_vec_ext=vec_ext,
+        ).to(device).eval()
+
+    if 'joint_v2' in modes:
+        infer_models['joint_v2'] = bench.DINJointInferV2(
+            model=model,
+            seq_feature_info=host_data_meta['seq_feature_info'],
+            input_dim=host_data_meta['input_dim'],
+            num_seq_per_sample=host_data_meta['num_seq_per_sample'],
+            max_seq_len=host_data_meta['max_seq_len'],
+            emblayer_seq_ext=seq_ext,
+            emblayer_vec_ext=vec_ext,
+        ).to(device).eval()
+
+    missing = [m for m in modes if m not in infer_models]
+    if missing:
+        raise RuntimeError(f'missing infer models for modes: {missing}')
     return infer_models
 
 
@@ -192,7 +274,7 @@ def _simulate_baseline_padding(seq_lengths: List[int], max_seq_len: int):
 def _simulate(mode: str,
               model,
               infer_models,
-              host_data_cache: Dict[int, Dict],
+              host_data_cache: Dict[int, Tuple[Dict, float, Dict]],
               device: str,
               arrival_rate: float,
               duration_s: float,
@@ -207,6 +289,10 @@ def _simulate(mode: str,
     queue_wait_ms = []
     h2d_only_samples = []
     h2d_pure_samples = []
+    concat_ms_samples = []
+    h2d_total_numel_samples = []
+    h2d_data_numel_samples = []
+    h2d_meta_numel_samples = []
 
     start = time.perf_counter()
     end = start + duration_s
@@ -242,15 +328,22 @@ def _simulate(mode: str,
                 _simulate_baseline_padding(batch_lengths, model.max_seq_len)
 
             if batch_size not in host_data_cache:
-                host_data_cache[batch_size] = bench.build_inputs(
-                    model=model,
-                    feature_columns=model.feature_columns,
-                    batch_size=batch_size,
-                    max_seq_len=model.max_seq_len,
-                    avg_seq_len=model.avg_seq_len,
-                    seed=seed + batch_size,
-                )
-            host_data = host_data_cache[batch_size]
+                t_start = time.perf_counter()
+                for _ in range(5):
+                    tmp_data = bench.build_inputs(
+                        model=model,
+                        feature_columns=model.feature_columns,
+                        batch_size=batch_size,
+                        max_seq_len=model.max_seq_len,
+                        avg_seq_len=model.avg_seq_len,
+                        seed=seed + batch_size,
+                    )
+                t_end = time.perf_counter()
+                concat_ms = (t_end - t_start) * 1000.0 / 5.0
+                numel_breakdown = bench.h2d_numel_breakdown(mode, tmp_data, scheduler_side_concat=False)
+                host_data_cache[batch_size] = (tmp_data, concat_ms, numel_breakdown)
+            
+            host_data, concat_ms, numel_breakdown = host_data_cache[batch_size]
 
             if batch_size not in h2d_cache:
                 h2d_cache[batch_size] = _compute_h2d_cache(mode, host_data, device, iters=10, warmup=3)
@@ -264,6 +357,10 @@ def _simulate(mode: str,
             h2d_only, h2d_pure = h2d_cache[batch_size]
             h2d_only_samples.append(h2d_only)
             h2d_pure_samples.append(h2d_pure)
+            concat_ms_samples.append(concat_ms)
+            h2d_total_numel_samples.append(numel_breakdown['total'])
+            h2d_data_numel_samples.append(numel_breakdown['data'])
+            h2d_meta_numel_samples.append(numel_breakdown['meta'])
 
             batch_sizes.append(batch_size)
             done_time = t1
@@ -293,8 +390,15 @@ def _simulate(mode: str,
     h2d_bubble = max(avg_h2d_only - avg_h2d_pure, 0.0)
     bubble_ratio = 0.0 if avg_h2d_only <= 0 else h2d_bubble / avg_h2d_only * 100.0
 
+    avg_concat = float(np.mean(concat_ms_samples)) if concat_ms_samples else 0.0
+    avg_h2d_total_numel = float(np.mean(h2d_total_numel_samples)) if h2d_total_numel_samples else 0.0
+    avg_h2d_data_numel = float(np.mean(h2d_data_numel_samples)) if h2d_data_numel_samples else 0.0
+    avg_h2d_meta_numel = float(np.mean(h2d_meta_numel_samples)) if h2d_meta_numel_samples else 0.0
+
+    display_mode = MODE_DISPLAY.get(mode, mode)
+
     return RunResult(
-        mode='emblayerV2' if mode == 'joint_v2' else 'baseline',
+        mode=display_mode,
         arrival_rate=arrival_rate,
         duration_s=duration_s,
         total_requests=total_requests,
@@ -312,6 +416,10 @@ def _simulate(mode: str,
         h2d_bubble_ratio_pct=bubble_ratio,
         sm_util_avg_pct=sm_avg,
         gpu_util_avg_pct=gpu_avg,
+        avg_h2d_total_numel=avg_h2d_total_numel,
+        avg_h2d_data_numel=avg_h2d_data_numel,
+        avg_h2d_meta_numel=avg_h2d_meta_numel,
+        avg_concat_ms=avg_concat,
     )
 
 
@@ -330,14 +438,14 @@ def _write_csv(path: str, rows: List[RunResult]):
             'mode', 'arrival_rate', 'duration_s', 'total_requests', 'throughput_qps',
             'avg_ms', 'p50_ms', 'p95_ms', 'p99_ms', 'avg_batch_size', 'max_batch_size',
             'avg_queue_ms', 'avg_h2d_only_ms', 'avg_h2d_pure_ms', 'h2d_bubble_ms', 'h2d_bubble_ratio_pct',
-            'sm_util_avg_pct', 'gpu_util_avg_pct'
+            'sm_util_avg_pct', 'gpu_util_avg_pct', 'avg_h2d_total_numel', 'avg_h2d_data_numel', 'avg_h2d_meta_numel', 'avg_concat_ms'
         ])
         for r in rows:
             writer.writerow([
                 r.mode, r.arrival_rate, r.duration_s, r.total_requests, r.throughput_qps,
                 r.avg_ms, r.p50_ms, r.p95_ms, r.p99_ms, r.avg_batch_size, r.max_batch_size,
                 r.avg_queue_ms, r.avg_h2d_only_ms, r.avg_h2d_pure_ms, r.h2d_bubble_ms, r.h2d_bubble_ratio_pct,
-                r.sm_util_avg_pct, r.gpu_util_avg_pct
+                r.sm_util_avg_pct, r.gpu_util_avg_pct, r.avg_h2d_total_numel, r.avg_h2d_data_numel, r.avg_h2d_meta_numel, r.avg_concat_ms
             ])
 
 
@@ -349,27 +457,29 @@ def _write_report(path: str, p99_target_ms: float, sweep: List[RunResult], best:
     lines.append('')
     lines.append(f'## p99<={p99_target_ms:.1f}ms 下最大吞吐')
     lines.append('')
-    lines.append('| Mode | Arrival Rate | Max Throughput (QPS) | Avg Latency (ms) | p99 (ms) | Avg Batch | Queue (ms) | Avg H2D-only (ms) | H2D Bubble (ms) | H2D Bubble Ratio (%) | SM Util (%) | GPU Util (%) |')
-    lines.append('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    lines.append('| Mode | Arrival Rate | Max Throughput (QPS) | Avg Latency (ms) | p99 (ms) | Avg Batch | Queue (ms) | Avg H2D-only (ms) | H2D Bubble (ms) | H2D Bubble Ratio (%) | SM Util (%) | GPU Util (%) | Avg Concat (ms) | H2D Total Numel | H2D Data Numel | H2D Meta Numel |')
+    lines.append('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
     for r in best:
         if r is None:
             continue
         lines.append(
             f"| {r.mode} | {r.arrival_rate:.1f} | {r.throughput_qps:.1f} | {r.avg_ms:.3f} | {r.p99_ms:.3f} | "
             f"{r.avg_batch_size:.2f} | {r.avg_queue_ms:.3f} | {r.avg_h2d_only_ms:.4f} | {r.h2d_bubble_ms:.4f} | {r.h2d_bubble_ratio_pct:.2f}% | "
-            f"{r.sm_util_avg_pct if r.sm_util_avg_pct is not None else 'N/A'} | {r.gpu_util_avg_pct if r.gpu_util_avg_pct is not None else 'N/A'} |"
+            f"{r.sm_util_avg_pct if r.sm_util_avg_pct is not None else 'N/A'} | {r.gpu_util_avg_pct if r.gpu_util_avg_pct is not None else 'N/A'} | "
+            f"{r.avg_concat_ms:.3f} | {r.avg_h2d_total_numel:.0f} | {r.avg_h2d_data_numel:.0f} | {r.avg_h2d_meta_numel:.0f} |"
         )
 
     lines.append('')
     lines.append('## Sweep 详情')
     lines.append('')
-    lines.append('| Mode | Arrival Rate | Throughput (QPS) | Avg (ms) | p99 (ms) | Avg Batch | Queue (ms) | H2D-only (ms) | Pure H2D (ms) | Bubble Ratio (%) | SM Util (%) | GPU Util (%) |')
-    lines.append('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
+    lines.append('| Mode | Arrival Rate | Throughput (QPS) | Avg (ms) | p99 (ms) | Avg Batch | Queue (ms) | H2D-only (ms) | Pure H2D (ms) | Bubble Ratio (%) | SM Util (%) | GPU Util (%) | Avg Concat (ms) | H2D Total Numel | H2D Data Numel | H2D Meta Numel |')
+    lines.append('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|')
     for r in sweep:
         lines.append(
             f"| {r.mode} | {r.arrival_rate:.1f} | {r.throughput_qps:.1f} | {r.avg_ms:.3f} | {r.p99_ms:.3f} | "
             f"{r.avg_batch_size:.2f} | {r.avg_queue_ms:.3f} | {r.avg_h2d_only_ms:.4f} | {r.avg_h2d_pure_ms:.4f} | {r.h2d_bubble_ratio_pct:.2f}% | "
-            f"{r.sm_util_avg_pct if r.sm_util_avg_pct is not None else 'N/A'} | {r.gpu_util_avg_pct if r.gpu_util_avg_pct is not None else 'N/A'} |"
+            f"{r.sm_util_avg_pct if r.sm_util_avg_pct is not None else 'N/A'} | {r.gpu_util_avg_pct if r.gpu_util_avg_pct is not None else 'N/A'} | "
+            f"{r.avg_concat_ms:.3f} | {r.avg_h2d_total_numel:.0f} | {r.avg_h2d_data_numel:.0f} | {r.avg_h2d_meta_numel:.0f} |"
         )
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -378,7 +488,7 @@ def _write_report(path: str, p99_target_ms: float, sweep: List[RunResult], best:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Online arrival batch scheduler simulation for baseline vs emblayerV2')
+    parser = argparse.ArgumentParser(description='Online arrival batch scheduler simulation for baseline, multislice, emblayerV1/V2')
     parser.add_argument('--arrival_rates', type=str, default='2000,4000,8000,12000,16000')
     parser.add_argument('--p99_target_ms', type=float, default=100.0)
     parser.add_argument('--duration_s', type=float, default=30.0)
@@ -394,12 +504,15 @@ def main():
     parser.add_argument('--seed', type=int, default=2026)
     parser.add_argument('--out_dir', type=str, default='./batchscheduler_outputs')
     parser.add_argument('--cpu', action='store_true')
+    parser.add_argument('--modes', type=str, default='baseline,multislice,emblayerV1,emblayerV2',
+                        help='Comma-separated modes to run; aliases: emblayer/emblayerV1/v1, emblayerV2/v2')
     args = parser.parse_args()
 
     if args.user_sparse_count < 0 or args.user_sparse_count > args.num_sparse:
         raise ValueError('--user_sparse_count must be in [0, num_sparse]')
 
     arrival_rates = _parse_float_list(args.arrival_rates)
+    modes = _parse_modes(args.modes)
 
     device = 'cpu'
     if not args.cpu and torch.cuda.is_available():
@@ -429,11 +542,11 @@ def main():
         avg_seq_len=args.avg_seq_len,
         seed=args.seed,
     )
-    infer_models = _build_infer_models(model, host_data_meta, device)
+    infer_models = _build_infer_models(model, host_data_meta, device, modes)
 
     results = []
-    for mode in ('baseline', 'joint_v2'):
-        host_cache: Dict[int, Dict] = {}
+    for mode in modes:
+        host_cache: Dict[int, Tuple[Dict, float, Dict]] = {}
         h2d_cache: Dict[int, Tuple[float, float]] = {}
         for rate in arrival_rates:
             res = _simulate(
@@ -454,21 +567,17 @@ def main():
                 f"mode={res.mode} rate={rate:.1f} qps={res.throughput_qps:.1f} p99={res.p99_ms:.3f} "
                 f"avg_batch={res.avg_batch_size:.2f} sm={res.sm_util_avg_pct} gpu={res.gpu_util_avg_pct}")
             
-            # 击穿点检测：当当前模式 p99 超过目标 3 倍时，提前停止该模式的后续更高负载 sweep
-            if res.p99_ms > 3 * args.p99_target_ms:
-                if mode == 'baseline':
-                    print(
-                        f"[INFO] baseline p99={res.p99_ms:.3f} exceeds target {args.p99_target_ms:.1f}ms, "
-                        "stop baseline sweep and continue with experimental group")
-                elif mode == 'joint_v2':
-                    print(
-                        f"[INFO] emblayerV2 p99={res.p99_ms:.3f} exceeds target {args.p99_target_ms:.1f}ms, "
-                        "stop emblayerV2 sweep")
+            # 击穿点检测：当当前模式 p99 超过目标 3 倍时，提前停止该模式的后续更高负载 sweep.避免warm时误判
+            if res.p99_ms > 10 * args.p99_target_ms and rate > min(arrival_rates):
+                print(
+                    f"[INFO] {res.mode} p99={res.p99_ms:.3f} exceeds target {args.p99_target_ms:.1f}ms, "
+                    "stop this mode's sweep")
                 break
 
     best_rows = []
-    for mode in ('baseline', 'emblayerV2'):
-        mode_rows = [r for r in results if r.mode == mode]
+    for mode in modes:
+        display_mode = MODE_DISPLAY.get(mode, mode)
+        mode_rows = [r for r in results if r.mode == display_mode]
         best = _select_best_under_p99(mode_rows, args.p99_target_ms)
         if best is not None:
             best_rows.append(best)
@@ -500,4 +609,5 @@ if __name__ == '__main__':
 #   --num_sparse 200 --num_seq 100 \
 #   --user_sparse_count 100 \
 #   --even_vocab_size 4096 --odd_vocab_size 64 \
+#   --modes baseline,multislice,emblayerV1,emblayerV2 \
 #   --out_dir ./batchscheduler_outputs

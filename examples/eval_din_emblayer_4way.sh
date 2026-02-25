@@ -397,6 +397,23 @@ def parse_h2d_bytes(log_text):
   return m.group(1), m.group(2), m.group(3)
 
 
+def parse_host_build_ms(log_text):
+  m = re.search(r"host_data_build\(ms\):\s*([0-9.]+)", log_text)
+  if not m:
+    return "N/A"
+  return m.group(1)
+
+
+def parse_feature_concat_prepare_ms(log_text):
+  m = re.search(r"feature-concat-prepare\(ms\):\s*([0-9.]+)", log_text)
+  if m:
+    return m.group(1)
+  m = re.search(r"h2d-prepare-overhead\(ms\):\s*([0-9.]+)", log_text)
+  if m:
+    return m.group(1)
+  return "N/A"
+
+
 def parse_kernel_launch_count(stats_path):
   text = read_text(stats_path)
   if not text:
@@ -455,8 +472,8 @@ lines.append("本报告由 `examples/eval_din_emblayer_4way.sh` 自动生成。"
 lines.append("")
 lines.append("## 总览")
 lines.append("")
-lines.append("| Stage | Avg Latency (ms) | H2D-only (ms) | Pure H2D (ms) | H2D Total (B) | H2D Data (B) | H2D Meta (B) | Kernel Launches | ONNX Nodes | Avg Latency提升 | H2D-only提升 | Pure H2D提升 | H2D Total提升 | H2D Data提升 | H2D Meta提升 | Kernel Launches提升 |")
-lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+lines.append("| Stage | Host Data Build (ms) | Feature Concat Prepare (ms) | Avg Latency (ms) | H2D-only (ms) | Pure H2D (ms) | H2D Total (B) | H2D Data (B) | H2D Meta (B) | Kernel Launches | ONNX Nodes | Build提升 | Concat提升 | Avg Latency提升 | H2D-only提升 | Pure H2D提升 | H2D Total提升 | H2D Data提升 | H2D Meta提升 | Kernel Launches提升 |")
+lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 
 baseline_txt = read_text(stage_info["stage1_baseline"]["log"])
 baseline_avg = first_match(baseline_txt, [
@@ -471,7 +488,11 @@ baseline_h2d_pure = first_match(baseline_txt, [
   r"baseline h2d-pure \(ms\):\s*([0-9.]+)",
   r"h2d-pure \(ms\):\s*([0-9.]+)",
 ])
+baseline_build_ms = parse_host_build_ms(baseline_txt)
+baseline_concat_ms = parse_feature_concat_prepare_ms(baseline_txt)
 baseline_total_b, baseline_data_b, baseline_meta_b = parse_h2d_bytes(baseline_txt)
+baseline_build_ms_v = to_float_or_none(baseline_build_ms)
+baseline_concat_ms_v = to_float_or_none(baseline_concat_ms)
 baseline_avg_v = to_float_or_none(baseline_avg)
 baseline_h2d_v = to_float_or_none(baseline_h2d)
 baseline_h2d_pure_v = to_float_or_none(baseline_h2d_pure)
@@ -503,8 +524,12 @@ for key, info in stage_info.items():
       r"joint_v2 h2d-pure \(ms\):\s*([0-9.]+)",
       r"h2d-pure \(ms\):\s*([0-9.]+)",
     ])
+    build_ms = parse_host_build_ms(txt)
+    concat_ms = parse_feature_concat_prepare_ms(txt)
     total_b, data_b, meta_b = parse_h2d_bytes(txt)
     kernel_launches = parse_kernel_launch_count(os.path.join(os.path.dirname(report_path), info["stats"]))
+    build_improve = pct_improve_vs_base(baseline_build_ms_v, to_float_or_none(build_ms))
+    concat_improve = pct_improve_vs_base(baseline_concat_ms_v, to_float_or_none(concat_ms))
     avg_improve = pct_improve_vs_base(baseline_avg_v, to_float_or_none(avg))
     h2d_improve = pct_improve_vs_base(baseline_h2d_v, to_float_or_none(h2d))
     h2d_pure_improve = pct_improve_vs_base(baseline_h2d_pure_v, to_float_or_none(h2d_pure))
@@ -514,8 +539,8 @@ for key, info in stage_info.items():
     kernel_launch_improve = pct_improve_vs_base(baseline_kernel_launches_v, to_int_or_none(kernel_launches))
     s = onnx_summary(info["onnx"])
     lines.append(
-        f"| {info['title']} | {avg} | {h2d} | {h2d_pure} | {total_b} | {data_b} | {meta_b} | {kernel_launches} | {s['nodes']} | "
-        f"{avg_improve} | {h2d_improve} | {h2d_pure_improve} | {total_b_improve} | {data_b_improve} | {meta_b_improve} | {kernel_launch_improve} |"
+      f"| {info['title']} | {build_ms} | {concat_ms} | {avg} | {h2d} | {h2d_pure} | {total_b} | {data_b} | {meta_b} | {kernel_launches} | {s['nodes']} | "
+      f"{build_improve} | {concat_improve} | {avg_improve} | {h2d_improve} | {h2d_pure_improve} | {total_b_improve} | {data_b_improve} | {meta_b_improve} | {kernel_launch_improve} |"
     )
 
 lines.append("")
